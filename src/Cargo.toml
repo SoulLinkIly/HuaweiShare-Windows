@@ -1,0 +1,73 @@
+[package]
+name = "hwshare-core"
+version = "1.6.2"
+edition = "2021"
+description = "Windows 端华为分享协议实现"
+license = "GPL-3.0-only"
+
+[lib]
+name = "hwshare_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hwshare-cli"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "hwshare"
+path = "src/bin/hwshare.rs"
+
+[[bin]]
+name = "hwshare-wirefull"
+path = "src/bin/wirefull.rs"
+required-features = ["diag"]
+
+[features]
+default = ["diag"]
+diag = []
+
+[dependencies]
+aes-gcm = "0.10"
+aes = "0.8"
+generic-array = "0.14"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+rsa = { version = "0.9", features = ["sha2"] }
+rand = "0.8"
+serde_json = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
