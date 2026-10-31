@@ -313,7 +313,7 @@ pub fn dfile_decrypt_control(key: &[u8], header: (u8, u8, u16, u16), payload: &[
 pub const DFILE_MAX_CONTENT: usize = 65535 - 50;
 
 pub fn dfile_data_chunk(key: &[u8], content: &[u8], sequence: u32, flags: u8, file_id: u16) -> Result<Vec<u8>> {
-    if content.is_empty() || content.len() > DFILE_MAX_CONTENT || !matches!(flags, 0 | 1 | 3) || !(1..=16).contains(&file_id) {
+    if content.is_empty() || content.len() > DFILE_MAX_CONTENT || !matches!(flags, 0 | 1 | 3) || file_id == 0 {
         return Err(Error::Argument);
     }
     let mut nonce = [0u8; 12];
@@ -362,8 +362,11 @@ pub fn build_headers(entries: &[(u16, u64, Vec<u8>)]) -> Result<Vec<Vec<u8>>> {
     let mut payload = count.to_be_bytes().to_vec();
 
     for (file_id, size, name) in entries {
-        if !(1..=16).contains(file_id) || name.is_empty() || name.len() > 255 {
-            return Err(Error::Argument);
+        if *file_id == 0 || name.is_empty() || name.len() > 255 {
+            return Err(Error::Protocol(format!(
+                "文件清单条目不合法：id={file_id} 名字长度={}",
+                name.len()
+            )));
         }
         let mut unit = Vec::with_capacity(12 + name.len());
         unit.extend_from_slice(&file_id.to_be_bytes());

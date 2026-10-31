@@ -80,7 +80,7 @@ fn run() -> ExitCode {
         Some("clip") => cmd_clip(&args[2..]),
         Some("listen") => cmd_listen(&args[2..]),
         Some("serve") => cmd_serve(&args[2..]),
-        Some("tray") => cmd_tray(&args[2..]),
+        Some("tray") => cmd_tray(&args[2..], false),
         Some("selftest") => cmd_selftest(),
 
         Some("preview") => {
@@ -157,7 +157,7 @@ fn run() -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        None => cmd_tray(&[]),
+        None => cmd_tray(&[], true),
         _ => {
             usage();
             ExitCode::from(1)
@@ -767,7 +767,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     }
 }
 
-fn cmd_tray(args: &[String]) -> ExitCode {
+fn cmd_tray(args: &[String], open_panel: bool) -> ExitCode {
     let port = flag_value(args, "--port")
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(5684);
@@ -812,6 +812,11 @@ fn cmd_tray(args: &[String]) -> ExitCode {
         .to_string();
     hwshare_core::tray::set_context(&cfg.name, &dest_text, &cfg.local);
     hwshare_core::tray::hide_console();
+
+    if open_panel {
+        hwshare_core::dropzone::toggle();
+        hwshare_core::tray::log_line("双击启动：自动弹出投递窗口");
+    }
 
     let verbose = std::env::var("HWSHARE_DEBUG").is_ok();
     std::thread::spawn(move || {

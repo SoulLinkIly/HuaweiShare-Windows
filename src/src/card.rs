@@ -1039,16 +1039,17 @@ fn lo_word(v: LPARAM) -> i32 {
 }
 
 fn short_name(name: &str) -> String {
-    if name.chars().count() > 12 {
-        let mut t: String = name.chars().take(11).collect();
-
+    let tail = name.rsplit('的').next().unwrap_or(name).trim();
+    let base = if tail.is_empty() { name.trim() } else { tail };
+    if base.chars().count() > 16 {
+        let mut t: String = base.chars().take(15).collect();
         while t.ends_with(' ') {
             t.pop();
         }
         t.push('…');
         t
     } else {
-        name.to_string()
+        base.to_string()
     }
 }
 

@@ -16,6 +16,8 @@ impl PeerInfo {
     }
 }
 
+pub const ALIVE: Duration = Duration::from_secs(8);
+
 static PEERS: Mutex<Vec<PeerInfo>> = Mutex::new(Vec::new());
 
 static DEFAULT: Mutex<Option<PeerInfo>> = Mutex::new(None);
@@ -89,7 +91,7 @@ pub fn selected() -> Option<PeerInfo> {
         return Some(current);
     }
 
-    let mut alive = snapshot(Duration::from_secs(180));
+    let mut alive = snapshot(ALIVE);
     if alive.len() == 1 {
         return alive.pop();
     }
@@ -100,7 +102,7 @@ pub fn is_online(peer: &PeerInfo) -> bool {
     let Ok(list) = PEERS.lock() else {
         return false;
     };
-    list.iter().any(|p| p.host == peer.host && p.seen.elapsed() <= Duration::from_secs(180))
+    list.iter().any(|p| p.host == peer.host && p.seen.elapsed() <= ALIVE)
 }
 
 #[cfg(test)]

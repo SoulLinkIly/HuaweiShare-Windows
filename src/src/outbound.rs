@@ -332,16 +332,18 @@ pub struct Report {
     pub bytes: u64,
 }
 
-fn collect(paths: &[PathBuf]) -> Result<Vec<Outgoing>> {
+fn collect(paths: &[PathBuf]) -> Result<(Vec<Outgoing>, usize)> {
     if paths.is_empty() {
         return Err(Error::Argument);
     }
     let mut out = Vec::new();
-    for (index, path) in paths.iter().enumerate() {
+    let mut skipped = 0usize;
+    for path in paths {
         let meta = std::fs::metadata(path)
             .map_err(|e| Error::Io(format!("读取 {} 失败: {e}", path.display())))?;
         if !meta.is_file() {
-            return Err(Error::Argument);
+            skipped += 1;
+            continue;
         }
         if meta.len() == 0 {
             return Err(Error::Protocol(format!(
@@ -354,13 +356,18 @@ fn collect(paths: &[PathBuf]) -> Result<Vec<Outgoing>> {
             .map(|n| n.to_string_lossy().to_string())
             .ok_or(Error::Argument)?;
         out.push(Outgoing {
-            id: (index + 1) as u16,
+            id: (out.len() + 1) as u16,
             name,
             size: meta.len(),
             path: path.clone(),
         });
     }
-    Ok(out)
+    if out.is_empty() {
+        return Err(Error::Protocol(
+            "选中的都是文件夹，请选中里面的文件再发".to_string(),
+        ));
+    }
+    Ok((out, skipped))
 }
 
 fn local_ipv4(peer: &str) -> Result<String> {
@@ -685,7 +692,10 @@ fn send_once(
     log: &dyn Fn(&str),
     progress: &Arc<AtomicU64>,
 ) -> Result<Report> {
-    let files = collect(paths)?;
+    let (files, skipped) = collect(paths)?;
+    if skipped > 0 {
+        log(&format!("已跳过 {skipped} 个文件夹（只发文件）"));
+    }
     let total: u64 = files.iter().map(|f| f.size).sum();
     let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
 

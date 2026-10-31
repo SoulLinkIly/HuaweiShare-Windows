@@ -1,6 +1,6 @@
 [package]
 name = "hwshare-core"
-version = "1.6.2"
+version = "1.6.3"
 edition = "2021"
 description = "Windows 端华为分享协议实现"
 license = "GPL-3.0-only"

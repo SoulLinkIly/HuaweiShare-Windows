@@ -24,10 +24,7 @@ const ID_PICK_DIR: usize = 1008;
 const ID_SEND_BASE: usize = 1200;
 
 const ID_TARGET_BASE: usize = 1400;
-const ID_SEND_NONE: usize = 1299;
-
 const ID_CLIP_BASE: usize = 1300;
-const ID_CLIP_NONE: usize = 1399;
 const ID_QUIT: usize = 1099;
 
 const TRAY_UID: u32 = 1;
@@ -269,34 +266,30 @@ unsafe fn show_menu(hwnd: HWND) {
         return;
     }
 
-    let peers = crate::peers::snapshot(std::time::Duration::from_secs(180));
-    let effective = crate::peers::selected();
+    let peers = crate::peers::snapshot(crate::peers::ALIVE);
+    let selected = crate::peers::selected();
+    let selected_online = selected
+        .as_ref()
+        .map(|p| peers.iter().any(|q| q.host == p.host))
+        .unwrap_or(false);
     let target_menu = CreatePopupMenu();
-    if peers.is_empty() {
+    for (index, peer) in peers.iter().enumerate() {
+        let checked = selected
+            .as_ref()
+            .map(|e| e.host == peer.host && e.port == peer.port)
+            .unwrap_or(false);
+        let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
         AppendMenuW(
             target_menu,
-            MF_STRING | MF_GRAYED,
-            ID_SEND_NONE,
-            wide("未发现设备（先打开手机华为分享）").as_ptr(),
+            flags,
+            ID_TARGET_BASE + index,
+            wide(&peer.label()).as_ptr(),
         );
-    } else {
-        for (index, peer) in peers.iter().enumerate() {
-            let checked = effective
-                .as_ref()
-                .map(|e| e.host == peer.host && e.port == peer.port)
-                .unwrap_or(false);
-            let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
-            AppendMenuW(
-                target_menu,
-                flags,
-                ID_TARGET_BASE + index,
-                wide(&peer.label()).as_ptr(),
-            );
-        }
     }
-    let target_label = match &effective {
-        Some(p) => format!("发送目标：{}", p.name),
-        None => "发送目标：未选择".to_string(),
+    let target_label = match (&selected, selected_online) {
+        (Some(p), true) => format!("发送目标：{}", p.name),
+        (Some(p), false) => format!("发送目标：{}（离线）", p.name),
+        (None, _) => "发送目标：未选择".to_string(),
     };
     AppendMenuW(
         menu,
@@ -312,22 +305,13 @@ unsafe fn show_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_STRING, ID_PICK_DIR, wide("选择接收文件夹…").as_ptr());
 
     let submenu = CreatePopupMenu();
-    if peers.is_empty() {
+    for (index, peer) in peers.iter().enumerate() {
         AppendMenuW(
             submenu,
-            MF_STRING | MF_GRAYED,
-            ID_SEND_NONE,
-            wide("未发现设备（先打开手机华为分享）").as_ptr(),
+            MF_STRING,
+            ID_SEND_BASE + index,
+            wide(&peer.label()).as_ptr(),
         );
-    } else {
-        for (index, peer) in peers.iter().enumerate() {
-            AppendMenuW(
-                submenu,
-                MF_STRING,
-                ID_SEND_BASE + index,
-                wide(&peer.label()).as_ptr(),
-            );
-        }
     }
     if let Ok(mut slot) = MENU_PEERS.lock() {
         *slot = peers.clone();
@@ -340,22 +324,13 @@ unsafe fn show_menu(hwnd: HWND) {
     );
 
     let clip_menu = CreatePopupMenu();
-    if peers.is_empty() {
+    for (index, peer) in peers.iter().enumerate() {
         AppendMenuW(
             clip_menu,
-            MF_STRING | MF_GRAYED,
-            ID_CLIP_NONE,
-            wide("未发现设备（先打开手机华为分享）").as_ptr(),
+            MF_STRING,
+            ID_CLIP_BASE + index,
+            wide(&peer.label()).as_ptr(),
         );
-    } else {
-        for (index, peer) in peers.iter().enumerate() {
-            AppendMenuW(
-                clip_menu,
-                MF_STRING,
-                ID_CLIP_BASE + index,
-                wide(&peer.label()).as_ptr(),
-            );
-        }
     }
     let clip_flags = MF_POPUP | MF_STRING | if peers.is_empty() { MF_GRAYED } else { 0 };
     AppendMenuW(

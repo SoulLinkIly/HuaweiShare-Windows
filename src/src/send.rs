@@ -14,15 +14,13 @@ pub fn collect(paths: &[PathBuf]) -> Result<(Vec<(String, u64)>, u64)> {
     for path in paths {
         let meta = std::fs::metadata(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
         if !meta.is_file() {
-            return Err(Error::Argument);
+            continue;
         }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or(Error::Argument)?
-            .to_string();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         total += meta.len();
-        entries.push((name, meta.len()));
+        entries.push((name.to_string(), meta.len()));
     }
     Ok((entries, total))
 }
