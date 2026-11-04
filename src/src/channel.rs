@@ -74,7 +74,6 @@ fn tune_keepalive(stream: &TcpStream) {
             &on as *const i32 as *const u8,
             4,
         );
-
         let ka = tcp_keepalive {
             onoff: 1,
             keepalivetime: 30_000,
@@ -113,7 +112,6 @@ impl Channel {
             .map_err(|_| Error::Argument)?;
         let stream = TcpStream::connect_timeout(&sock, timeout).map_err(|e| {
             let msg = format!("连接 {ip}:{port} 失败: {e}");
-
             crate::trace::channel_fail(ip, port, &msg);
             Error::Io(msg)
         })?;
@@ -135,7 +133,6 @@ impl Channel {
 
     pub fn from_stream(stream: TcpStream, peer: impl Into<String>) -> Result<Self> {
         tune_socket(&stream);
-
         let _ = stream.set_nonblocking(false);
         Ok(Self {
             stream,
@@ -183,7 +180,7 @@ impl Channel {
             return;
         }
         self.ensure_trace_open();
-        crate::wire::rx(&self.label, data, self.conn);
+        crate::trace::bytes(&self.label, "rx", data, self.conn);
         self.rx_bytes += data.len() as u64;
         let mut merged = Vec::with_capacity(data.len() + self.pending.len());
         merged.extend_from_slice(data);
@@ -211,20 +208,18 @@ impl Channel {
         self.close_reason
     }
 
-    pub fn send(&mut self, data: &[u8]) -> Result<()> {
+    pub fn transmit(&mut self, data: &[u8]) -> Result<()> {
         self.ensure_trace_open();
-
         match self.stream.write_all(data) {
             Ok(()) => {
                 self.tx_bytes += data.len() as u64;
-                crate::wire::tx(&self.label, data, self.conn);
-                crate::trace::frame(&self.label, "tx", data, self.conn);
+                crate::trace::bytes(&self.label, "tx", data, self.conn);
+                crate::trace::wire_frame(&self.label, "tx", data, self.conn);
                 Ok(())
             }
             Err(e) => {
                 self.close_reason = "write-error";
                 let timeout = matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
-
                 crate::trace::note(
                     &self.label,
                     &format!("写失败：本帧 {} 字节未完整写出（{e}）", data.len()),
@@ -245,7 +240,6 @@ impl Channel {
         let deadline = Instant::now() + timeout;
         let mut buf = vec![0u8; size];
         let mut filled = 0usize;
-
         if !self.pending.is_empty() {
             let take = size.min(self.pending.len());
             buf[..take].copy_from_slice(&self.pending[..take]);
@@ -265,7 +259,7 @@ impl Channel {
                 }
                 Ok(n) => {
                     self.ensure_trace_open();
-                    crate::wire::rx(&self.label, &buf[filled..filled + n], self.conn);
+                    crate::trace::bytes(&self.label, "rx", &buf[filled..filled + n], self.conn);
                     self.rx_bytes += n as u64;
                     filled += n;
                 }
@@ -293,7 +287,7 @@ impl Channel {
             }
             Ok(n) => {
                 self.ensure_trace_open();
-                crate::wire::rx(&self.label, &buf[..n], self.conn);
+                crate::trace::bytes(&self.label, "rx", &buf[..n], self.conn);
                 self.rx_bytes += n as u64;
                 buf.truncate(n);
                 Ok(buf)
@@ -326,7 +320,7 @@ impl Channel {
             Ok(n) => {
                 self.pending.truncate(old + n);
                 self.ensure_trace_open();
-                crate::wire::rx(&self.label, &self.pending[old..], self.conn);
+                crate::trace::bytes(&self.label, "rx", &self.pending[old..], self.conn);
                 self.rx_bytes += n as u64;
                 Ok(n)
             }
@@ -374,7 +368,7 @@ impl Channel {
         Ok(out)
     }
 
-    pub fn read_frame(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+    pub fn read_channel_frame(&mut self, timeout: Duration) -> Result<Vec<u8>> {
         let deadline = Instant::now() + timeout;
         let mut data: Vec<u8> = Vec::with_capacity(FRAME_HEADER_SIZE);
         let mut expected = FRAME_HEADER_SIZE;
@@ -406,7 +400,7 @@ impl Channel {
             self.close_reason = "truncated";
             return Err(Error::Truncated);
         }
-        crate::trace::frame(&self.label, "rx", &data, self.conn);
+        crate::trace::wire_frame(&self.label, "rx", &data, self.conn);
         Ok(data)
     }
 
@@ -425,10 +419,10 @@ impl Channel {
                     })?;
                 let total = FRAME_HEADER_SIZE + len as usize;
                 if self.pending.len() >= total {
-                    let frame = self.pending[..total].to_vec();
+                    let wire_frame = self.pending[..total].to_vec();
                     self.pending.drain(..total);
-                    crate::trace::frame(&self.label, "rx", &frame, self.conn);
-                    return Ok(Some(frame));
+                    crate::trace::wire_frame(&self.label, "rx", &wire_frame, self.conn);
+                    return Ok(Some(wire_frame));
                 }
             }
 
@@ -458,10 +452,10 @@ impl Channel {
                 let size = u16::from_be_bytes([self.pending[6], self.pending[7]]) as usize;
                 let total = DFILE_HEADER + size;
                 if self.pending.len() >= total {
-                    let frame = self.pending[..total].to_vec();
+                    let wire_frame = self.pending[..total].to_vec();
                     self.pending.drain(..total);
-                    crate::trace::frame(&self.label, "rx", &frame, self.conn);
-                    return Ok(Some(frame));
+                    crate::trace::wire_frame(&self.label, "rx", &wire_frame, self.conn);
+                    return Ok(Some(wire_frame));
                 }
             }
 
@@ -485,6 +479,24 @@ impl Channel {
         self.close_reason = "shutdown";
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
+
+    pub fn graceful_close(&mut self, idle: Duration) {
+        self.close_reason = "closed";
+        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        let _ = self
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(50)));
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + idle;
+        while Instant::now() < deadline {
+            match self.stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl Drop for Channel {
@@ -492,11 +504,9 @@ impl Drop for Channel {
         if !crate::trace::enabled() {
             return;
         }
-
         if !self.traced_open {
             self.ensure_trace_open();
         }
-
         if !self.pending.is_empty() {
             crate::trace::frame_partial(&self.label, "rx", &self.pending, self.conn);
         }
@@ -527,7 +537,6 @@ impl Listener {
         inner
             .set_nonblocking(false)
             .map_err(|e| Error::Io(e.to_string()))?;
-
         crate::trace::listen("tcp", &bound.to_string());
         Ok(Self { inner, ip: ip.to_string(), port: bound.port() })
     }
@@ -580,7 +589,6 @@ impl Listener {
                     if Instant::now() >= deadline {
                         return Err(Error::Io("等待对端连接超时".into()));
                     }
-
                     spins += 1;
                     std::thread::sleep(if spins <= 20 {
                         Duration::from_millis(1)
@@ -607,9 +615,9 @@ mod tests {
         let port = listener.port;
         let writer = std::thread::spawn(move || {
             let mut c = Channel::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
-            c.send(&crate::transfer::dfile_settings(true)).unwrap();
-            let pkt = crate::transfer::dfile_packet(11, 0, 0, 0, b"xyz").unwrap();
-            c.send(&pkt).unwrap();
+            c.transmit(&crate::transfer::build_settings_payload(true)).unwrap();
+            let pkt = crate::transfer::assemble_dfile_packet(11, 0, 0, 0, b"xyz").unwrap();
+            c.transmit(&pkt).unwrap();
             std::thread::sleep(Duration::from_millis(120));
         });
 
@@ -640,18 +648,18 @@ mod tests {
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(80));
             let mut c = Channel::connect("127.0.0.1", port, Duration::from_secs(3)).unwrap();
-            let frame = frame_encode(9, 7, 0, b"hello").unwrap();
-            c.send(&frame).unwrap();
-            c.send(&frame).unwrap();
+            let wire_frame = frame_encode(9, 7, 0, b"hello").unwrap();
+            c.transmit(&wire_frame).unwrap();
+            c.transmit(&wire_frame).unwrap();
         });
 
         let mut server = listener.accept(Duration::from_secs(3)).unwrap();
-        let first = server.read_frame(Duration::from_secs(2)).unwrap();
+        let first = server.read_channel_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(first.len(), FRAME_HEADER_SIZE + 5);
         let (_, module, seq, _, len) = frame_decode(&first).unwrap();
         assert_eq!((module, seq, len), (9, 7, 5));
 
-        let second = server.read_frame(Duration::from_secs(2)).unwrap();
+        let second = server.read_channel_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(&second[FRAME_HEADER_SIZE..], b"hello");
         handle.join().unwrap();
     }
@@ -660,12 +668,11 @@ mod tests {
     fn failed_send_does_not_count_bytes() {
         let listener = Listener::bind("127.0.0.1", 0).unwrap();
         let port = listener.port;
-
         let mut chan = Channel::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
         let _peer = listener.accept(Duration::from_secs(5)).unwrap();
 
         chan.stream.shutdown(std::net::Shutdown::Write).unwrap();
-        assert!(chan.send(b"hello").is_err());
+        assert!(chan.transmit(b"hello").is_err());
         assert_eq!(chan.tx_bytes, 0, "写失败不能计进 tx_bytes");
         assert_eq!(chan.close_reason, "write-error");
     }
@@ -676,8 +683,8 @@ mod tests {
         let port = listener.port;
         let handle = std::thread::spawn(move || {
             let mut c = Channel::connect("127.0.0.1", port, Duration::from_secs(3)).unwrap();
-            c.send(&frame_encode(9, 1, 0, b"first").unwrap()).unwrap();
-            c.send(&frame_encode(9, 2, 0, b"second").unwrap()).unwrap();
+            c.transmit(&frame_encode(9, 1, 0, b"first").unwrap()).unwrap();
+            c.transmit(&frame_encode(9, 2, 0, b"second").unwrap()).unwrap();
             std::thread::sleep(Duration::from_millis(200));
         });
         let mut chan = listener.accept(Duration::from_secs(3)).unwrap();
@@ -690,9 +697,9 @@ mod tests {
 
         chan.put_back(&taken);
 
-        let first = chan.read_frame(Duration::from_secs(2)).unwrap();
+        let first = chan.read_channel_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(&first[FRAME_HEADER_SIZE..], b"first", "还回来的字节要排在队首");
-        let second = chan.read_frame(Duration::from_secs(2)).unwrap();
+        let second = chan.read_channel_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(&second[FRAME_HEADER_SIZE..], b"second");
         assert_eq!(
             chan.rx_bytes,

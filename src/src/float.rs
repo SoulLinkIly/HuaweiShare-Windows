@@ -1,4 +1,6 @@
 #![cfg(windows)]
+
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
@@ -7,7 +9,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SystemParameters
 pub const PEEK: i32 = 4;
 
 pub const SNAP: i32 = 18;
-
 const TUCK_EXTRA: i32 = 30;
 
 const SPI_GETWORKAREA: u32 = 0x0030;
@@ -43,6 +44,13 @@ impl Edge {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Layout {
+    pub x: i32,
+    pub y: i32,
+    pub edge: Edge,
+}
+
 #[derive(Clone, Copy)]
 struct DragState {
     grab_x: i32,
@@ -55,8 +63,8 @@ struct DragState {
 }
 
 static DRAG: Mutex<Option<DragState>> = Mutex::new(None);
-
 static ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static LAST_SAVED: Mutex<Option<Layout>> = Mutex::new(None);
 
 pub fn work_area() -> (i32, i32, i32, i32) {
     let mut rc: RECT = unsafe { std::mem::zeroed() };
@@ -70,6 +78,14 @@ pub fn work_area() -> (i32, i32, i32, i32) {
     }
 }
 
+pub fn clamp_to_work_area(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    let (left, top, right, bottom) = work_area();
+    (
+        x.clamp(left - w / 2, right - w / 2),
+        y.clamp(top, bottom - h / 2),
+    )
+}
+
 pub fn cursor() -> (i32, i32) {
     let mut pt = POINT { x: 0, y: 0 };
     unsafe {
@@ -79,11 +95,9 @@ pub fn cursor() -> (i32, i32) {
 }
 
 pub fn initial_pos(w: i32, h: i32, dpi: i32) -> (i32, i32) {
-    let (left, top, right, bottom) = work_area();
+    let (_, top, right, _) = work_area();
     if let Some((x, y)) = *ANCHOR.lock().unwrap_or_else(|e| e.into_inner()) {
-        let x = x.clamp(left - w / 2, right - w / 2);
-        let y = y.clamp(top, bottom - h / 2);
-        return (x, y);
+        return clamp_to_work_area(x, y, w, h);
     }
     let margin = 24 * dpi / 96;
     (right - w - margin, top + margin)
@@ -92,6 +106,47 @@ pub fn initial_pos(w: i32, h: i32, dpi: i32) -> (i32, i32) {
 pub fn remember(x: i32, y: i32) {
     if let Ok(mut slot) = ANCHOR.lock() {
         *slot = Some((x, y));
+    }
+}
+
+fn layout_path() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    Some(PathBuf::from(base).join("HWShareWin").join("window.json"))
+}
+
+fn parse_layout(text: &str) -> Option<Layout> {
+    let value: serde_json::Value =
+        serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text)).ok()?;
+    let x = value.get("x")?.as_i64()? as i32;
+    let y = value.get("y")?.as_i64()? as i32;
+    let edge = Edge::from_code(value.get("edge").and_then(|e| e.as_u64()).unwrap_or(0) as u8);
+    Some(Layout { x, y, edge })
+}
+
+pub fn load_layout() -> Option<Layout> {
+    let text = std::fs::read_to_string(layout_path()?).ok()?;
+    parse_layout(&text)
+}
+
+pub fn save_layout(x: i32, y: i32, edge: Edge) {
+    remember(x, y);
+    let layout = Layout { x, y, edge };
+    if let Ok(mut slot) = LAST_SAVED.lock() {
+        if *slot == Some(layout) {
+            return;
+        }
+        *slot = Some(layout);
+    }
+    let Some(path) = layout_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text = format!("{{\"x\":{},\"y\":{},\"edge\":{}}}", layout.x, layout.y, layout.edge.code());
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -129,7 +184,6 @@ pub fn drag_update(mouse: (i32, i32)) -> Option<(i32, i32, Edge)> {
     } else {
         v_edge
     };
-
     let (x, y) = keep_other_axis(edge, x, y, state.w, state.h, area);
     state.x = x;
     state.y = y;
@@ -221,16 +275,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_saved_layout() {
+        assert_eq!(
+            parse_layout(r#"{"x":1200,"y":40,"edge":2}"#),
+            Some(Layout { x: 1200, y: 40, edge: Edge::Right })
+        );
+        assert_eq!(
+            parse_layout("\u{feff}{\"x\":-8,\"y\":0,\"edge\":1}").unwrap().edge,
+            Edge::Left
+        );
+        assert_eq!(parse_layout(r#"{"x":1,"y":2}"#).unwrap().edge, Edge::None);
+        assert_eq!(parse_layout("not json"), None);
+        assert_eq!(parse_layout(r#"{"x":"1","y":2}"#), None);
+        assert_eq!(parse_layout(r#"{"y":2}"#), None);
+    }
+
+    #[test]
+    fn clamp_keeps_window_on_screen() {
+        let (left, top, right, bottom) = work_area();
+        let (w, h) = (344, 108);
+        assert_eq!(clamp_to_work_area(999_999, -999_999, w, h), (right - w / 2, top));
+        assert_eq!(clamp_to_work_area(-999_999, 999_999, w, h), (left - w / 2, bottom - h / 2));
+    }
+
+    #[test]
     fn snap_then_tuck_on_left() {
         let (x, edge, _) = axis(10, 570, 0, 2560, Edge::Left, Edge::Right);
         assert_eq!((x, edge), (0, Edge::None));
-
         let (x, edge, pen) = axis(-40, 570, 0, 2560, Edge::Left, Edge::Right);
         assert_eq!((x, edge, pen), (-40, Edge::Left, 40));
-
         let (x, edge, _) = axis(-2000, 570, 0, 2560, Edge::Left, Edge::Right);
         assert_eq!((x, edge), (PEEK - 570, Edge::Left));
-
         assert_eq!(axis(800, 570, 0, 2560, Edge::Left, Edge::Right), (800, Edge::None, 0));
     }
 
@@ -240,7 +315,6 @@ mod tests {
         assert_eq!((x, edge), (2560 - 570, Edge::None));
         let (x, edge, pen) = axis(2560 - 570 + 40, 570, 0, 2560, Edge::Left, Edge::Right);
         assert_eq!((x, edge, pen), (2560 - 570 + 40, Edge::Right, 40));
-
         let (x, edge, _) = axis(9999, 570, 0, 2560, Edge::Left, Edge::Right);
         assert_eq!((x, edge), (2560 - PEEK, Edge::Right));
     }
@@ -278,7 +352,6 @@ mod tests {
 
         let (x, y) = keep_other_axis(Edge::Top, 3000, PEEK - h, w, h, area);
         assert_eq!((x, y), (2216, PEEK - h));
-
         let (x, y) = keep_other_axis(Edge::Right, 0, 0, 5000, 5000, area);
         assert_eq!((x, y), (0, 0));
     }

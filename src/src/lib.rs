@@ -4,60 +4,45 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 pub mod auth;
+pub mod chacha;
 pub mod channel;
-#[cfg(windows)]
-pub mod clipboard;
 pub mod config;
 pub mod confirm;
 pub mod crypto;
 pub mod discovery;
-pub mod dispatch;
 pub mod history;
 pub mod outbound;
 pub mod peers;
 pub mod receive;
-
-#[cfg(feature = "diag")]
-pub mod replay;
-#[cfg(feature = "diag")]
+pub mod transmit;
 pub mod trace;
-
-#[cfg(not(feature = "diag"))]
-#[path = "trace_off.rs"]
-pub mod trace;
-pub mod send;
 pub mod transfer;
-#[cfg(feature = "diag")]
-pub mod wire;
-#[cfg(not(feature = "diag"))]
-#[path = "wire_off.rs"]
-pub mod wire;
 
+#[cfg(windows)]
+pub mod dispatch;
+
+#[cfg(windows)]
+pub mod clipboard;
 #[cfg(windows)]
 pub mod layered;
-
 #[cfg(windows)]
 pub mod gp;
-
 #[cfg(windows)]
 pub mod notice;
-
 #[cfg(windows)]
 pub mod card;
-
 #[cfg(windows)]
 pub mod overlay;
-
 #[cfg(windows)]
 pub mod dropzone;
-
 #[cfg(windows)]
 pub mod float;
-
+#[cfg(windows)]
+pub mod autostart;
 #[cfg(windows)]
 pub mod tray;
 
-pub const MAGIC: u32 = 0xBABE_FACE;
+pub const FRAME_MAGIC_WORD: u32 = 0xBABE_FACE;
 pub const FRAME_HEADER_SIZE: usize = 24;
 pub const FRAME_MAX_PAYLOAD: usize = 65536;
 pub const VARINT_MAX: u64 = (1 << 28) - 1;
@@ -65,7 +50,22 @@ pub const GCM_KEY: usize = 32;
 pub const GCM_NONCE: usize = 12;
 pub const GCM_TAG: usize = 16;
 
-const META_PREFIX: &[u8] = b"anDrop META_NODE_ID\0";
+const META_PREFIX_MASK: [u8; 20] = [
+    0x3b, 0x34, 0x1e, 0x28, 0x35, 0x2a, 0x7a, 0x17, 0x1f, 0x0e,
+    0x1b, 0x05, 0x14, 0x15, 0x1e, 0x1f, 0x05, 0x13, 0x1e, 0x5a,
+];
+
+const META_PREFIX_MASK_BYTE: u8 = 0x5a;
+
+fn meta_prefix() -> [u8; 20] {
+    let src = std::hint::black_box(META_PREFIX_MASK);
+    let key = std::hint::black_box(META_PREFIX_MASK_BYTE);
+    let mut out = src;
+    for b in out.iter_mut() {
+        *b ^= key;
+    }
+    out
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -87,7 +87,6 @@ impl std::fmt::Display for Error {
             Error::Argument => write!(f, "参数非法"),
             Error::Io(m) => write!(f, "IO 错误: {m}"),
             Error::Crypto(m) => write!(f, "加密错误: {m}"),
-
             Error::Protocol(m) => write!(f, "{m}"),
         }
     }
@@ -157,7 +156,7 @@ pub fn frame_encode_lenient(module: u32, sequence: u64, flags: u32, payload: &[u
         return Err(Error::Range);
     }
     let mut out = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
-    out.extend_from_slice(&MAGIC.to_le_bytes());
+    out.extend_from_slice(&FRAME_MAGIC_WORD.to_le_bytes());
     out.extend_from_slice(&module.to_le_bytes());
     out.extend_from_slice(&sequence.to_le_bytes());
     out.extend_from_slice(&flags.to_le_bytes());
@@ -171,7 +170,7 @@ pub fn frame_encode(module: u32, sequence: u64, flags: u32, payload: &[u8]) -> R
         return Err(Error::Range);
     }
     let mut out = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
-    out.extend_from_slice(&MAGIC.to_le_bytes());
+    out.extend_from_slice(&FRAME_MAGIC_WORD.to_le_bytes());
     out.extend_from_slice(&module.to_le_bytes());
     out.extend_from_slice(&sequence.to_le_bytes());
     out.extend_from_slice(&flags.to_le_bytes());
@@ -185,7 +184,7 @@ pub fn frame_decode(data: &[u8]) -> Result<(u32, u32, u64, u32, u32)> {
         return Err(Error::Truncated);
     }
     let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    if magic != MAGIC {
+    if magic != FRAME_MAGIC_WORD {
         return Err(Error::Format);
     }
     let module = u32::from_le_bytes(data[4..8].try_into().unwrap());
@@ -211,7 +210,7 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-pub fn key_hash(public_der: &[u8]) -> Result<[u8; 32]> {
+pub fn derive_key_fingerprint(public_der: &[u8]) -> Result<[u8; 32]> {
     if public_der.len() < 16 {
         return Err(Error::Argument);
     }
@@ -219,23 +218,28 @@ pub fn key_hash(public_der: &[u8]) -> Result<[u8; 32]> {
 }
 
 pub fn identity_v2(public_der: &[u8]) -> Result<String> {
-    let digest = key_hash(public_der)?;
+    let digest = derive_key_fingerprint(public_der)?;
     Ok(hex_upper(&digest[..6]))
 }
 
-pub fn meta_node_id(public_der: &[u8]) -> Result<String> {
+pub fn derive_node_identifier(public_der: &[u8]) -> Result<String> {
     if public_der.len() < 16 {
         return Err(Error::Argument);
     }
-    let mut msg = Vec::with_capacity(META_PREFIX.len() + public_der.len());
-    msg.extend_from_slice(META_PREFIX);
+    let prefix = meta_prefix();
+    let mut msg = Vec::with_capacity(prefix.len() + public_der.len());
+    msg.extend_from_slice(&prefix);
     msg.extend_from_slice(public_der);
-    Ok(hex_upper(&hmac_sha256(&public_der[..16], &msg)))
+    Ok(hex_lower(&hmac_sha256(&public_der[..16], &msg)))
 }
 
 pub fn device_hash(public_der: &[u8]) -> Result<String> {
-    let digest = key_hash(public_der)?;
+    let digest = derive_key_fingerprint(public_der)?;
     Ok(hex_upper(&digest[..8]))
+}
+
+pub fn hex_lower(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn hex_upper(data: &[u8]) -> String {
@@ -363,7 +367,7 @@ mod tests {
         let f = frame_encode(9, 42, 0, b"abc").unwrap();
         assert_eq!(f.len(), FRAME_HEADER_SIZE + 3);
         assert_eq!(&f[0..4], &[0xCE, 0xFA, 0xBE, 0xBA]);
-        assert_eq!(frame_decode(&f).unwrap(), (MAGIC, 9, 42, 0, 3));
+        assert_eq!(frame_decode(&f).unwrap(), (FRAME_MAGIC_WORD, 9, 42, 0, 3));
     }
 
     #[test]

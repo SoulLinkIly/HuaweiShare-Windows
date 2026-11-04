@@ -26,14 +26,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const CAPTION: &str = "华为分享 · 接收确认";
-
 const TIMEOUT_SECS: u64 = 30;
 
 const WM_DESTROY: u32 = 0x0002;
 const WM_CLOSE: u32 = 0x0010;
 const WM_GETDLGCODE: u32 = 0x0087;
 const WM_KEYDOWN: u32 = 0x0100;
-
 const WM_APP_CLOSE: u32 = 0x8001;
 const DLGC_WANTALLKEYS: isize = 0x0004;
 const VK_RETURN: usize = 0x0D;
@@ -47,12 +45,10 @@ const WM_PAINT: u32 = 0x000F;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_ERASEBKGND: u32 = 0x0014;
-
 const CARD_W: i32 = 400;
 const CARD_H: i32 = 176;
 const BTN_H: i32 = 46;
 const RADIUS: i32 = 22;
-
 const COL_BG: u32 = 0x00FF_FFFF;
 const COL_MAIN: u32 = 0x001A_1A1A;
 const COL_SUB: u32 = 0x0093_8E8E;
@@ -61,7 +57,6 @@ const COL_HOVER: u32 = 0x00F7_F2F2;
 const COL_ACCENT: u32 = 0x00FF_7A00;
 
 static CARD_DPI: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(96);
-
 static CANVAS: std::sync::OnceLock<Mutex<Option<crate::layered::Canvas>>> =
     std::sync::OnceLock::new();
 static WIN_POS: [std::sync::atomic::AtomicI32; 2] = [
@@ -74,7 +69,6 @@ static HOVER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
 const CLASS_NAME: &str = "HWShareConfirmWnd";
 
 static RESULT: AtomicI32 = AtomicI32::new(-1);
-
 static REASON: AtomicI32 = AtomicI32::new(0);
 
 fn reason_text(code: i32) -> &'static str {
@@ -118,7 +112,6 @@ enum Peer {
 
 fn probe(stream: &TcpStream, sink: &mut Vec<u8>) -> Peer {
     let _ = stream.set_nonblocking(true);
-
     let mut reader = stream;
     let mut buf = [0u8; 8192];
     let mut state = Peer::Alive;
@@ -178,7 +171,6 @@ impl Answer {
 
 static LINE_SUB: Mutex<String> = Mutex::new(String::new());
 static LINE_MAIN: Mutex<String> = Mutex::new(String::new());
-
 static FONT_SUB: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static FONT_MAIN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static FONT_BTN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -204,7 +196,6 @@ unsafe fn paint_card(hwnd: HWND) {
     let hdc = canvas.mem;
     let (w, h) = (canvas.w, canvas.h);
     let rc = RECT { left: 0, top: 0, right: w, bottom: h };
-
     let dpi = CARD_DPI.load(Ordering::SeqCst).max(96);
     let px = |v: i32| v * dpi / 96;
 
@@ -281,7 +272,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             paint_card(hwnd);
             0
         }
-
         WM_MOUSEMOVE => {
             let x = (lparam & 0xFFFF) as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i32;
@@ -310,14 +300,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         WM_ERASEBKGND => 1,
-
         WM_CLOSE => {
             RESULT.store(0, Ordering::SeqCst);
             REASON.store(6, Ordering::SeqCst);
             DestroyWindow(hwnd);
             0
         }
-
         WM_APP_CLOSE => {
             RESULT.store(0, Ordering::SeqCst);
             DestroyWindow(hwnd);
@@ -335,7 +323,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             0
         }
-
         WM_GETDLGCODE => DLGC_WANTALLKEYS,
         WM_DESTROY => {
             PostQuitMessage(0);
@@ -344,6 +331,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
+
+static ASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answer {
     #[cfg(windows)]
@@ -358,6 +347,10 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
     }
     crate::trace::confirm_show(peer, count, bytes);
 
+    let _serial = ASK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
     let class = wide(CLASS_NAME);
     let caption = wide(CAPTION);
@@ -368,7 +361,6 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = instance;
         wc.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW as *const u16) as _;
-
         wc.hbrBackground = std::ptr::null_mut();
         wc.lpszClassName = class.as_ptr();
         RegisterClassW(&wc);
@@ -378,7 +370,6 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
             if d == 0 { 96 } else { d as i32 }
         };
         CARD_DPI.store(dpi, Ordering::SeqCst);
-
         let cw = CARD_W * dpi / 96;
         let ch = CARD_H * dpi / 96;
 
@@ -445,7 +436,6 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
         paint_card(hwnd);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
-
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -479,7 +469,6 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
                         None => Peer::Alive,
                     }
                 };
-
                 let close = match peer {
                     Peer::Reset => true,
                     Peer::Eof => close_on_eof,
@@ -500,14 +489,12 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
         }
 
         let _ = guard.join();
-
         for f in [f_sub, f_main, f_btn] {
             if !f.is_null() {
                 DeleteObject(f as _);
             }
         }
         let yes = RESULT.load(Ordering::SeqCst) == 1;
-
         let drained: Vec<u8> = {
             let mut slot = drained.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *slot)

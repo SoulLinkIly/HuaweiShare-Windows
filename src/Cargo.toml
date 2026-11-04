@@ -1,30 +1,22 @@
 [package]
-name = "hwshare-core"
-version = "1.6.4"
+name = "hwshare"
+version = "1.7.8"
 edition = "2021"
-description = "Windows 端华为分享协议实现"
+description = "华为分享协议实现 —— 同时支持鸿蒙手机 / 鸿蒙 7 与 iPad / iPhone"
 license = "GPL-3.0-only"
+autobins = false
 
 [lib]
-name = "hwshare_core"
+name = "hwshare"
 path = "src/lib.rs"
-
-[[bin]]
-name = "hwshare-cli"
-path = "src/bin/cli.rs"
 
 [[bin]]
 name = "hwshare"
 path = "src/bin/hwshare.rs"
 
 [[bin]]
-name = "hwshare-wirefull"
-path = "src/bin/wirefull.rs"
-required-features = ["diag"]
-
-[features]
-default = ["diag"]
-diag = []
+name = "hwshare-cli"
+path = "src/bin/hwshare-cli.rs"
 
 [dependencies]
 aes-gcm = "0.10"
@@ -35,6 +27,7 @@ sha1 = "0.10"
 hmac = "0.12"
 rsa = { version = "0.9", features = ["sha2"] }
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -42,6 +35,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_SystemInformation",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
@@ -54,12 +51,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Console",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_Com",
-    "Win32_System_SystemInformation",
-    "Win32_Networking_WinSock",
-    "Win32_System_IO",
-    "Win32_Storage_FileSystem",
     "Win32_Security",
 ] }
 

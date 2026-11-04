@@ -1,96 +1,149 @@
 # 华为分享（Windows 端）
 
-在 Windows 上收发华为手机「华为分享」里的文件。**纯 Rust 单文件，1.9 MB，免安装、无运行时依赖**，
-双击即用。
+用 Rust 实现的华为分享协议桌面端。与**鸿蒙手机 / 鸿蒙 7 平板**、**iPad / iPhone** 双向互通：
+发现设备、发送文件、接收文件、发送剪贴板文本，全部在本机完成，不依赖华为电脑管家。
 
-> **非官方实现**。华为没有公开这套协议，本项目的发现流程、帧格式与加密参数都是从抓包和真机实验中
-> 还原出来的，只用于和自己手里的设备互通。与华为公司没有任何关系，也不包含华为的闭源组件。
-> 使用风险自负。
+版本 **1.7.8** · 许可 **GPL-3.0-only** · 仅 Windows（x86_64）
 
-![投递卡](images/drop.png)
+---
 
-## 能做什么
+## 目录结构
 
-- **双向传输**：手机 → 电脑、电脑 → 手机，流程与官方一致
-- **托盘常驻**：双击托盘图标弹出投递卡，拖文件进去即发送
-- **接收**：手机在分享面板里看到「电脑名」，选中发送即可，文件落到指定目录
-- **进度卡片**：进度环 + 已收/总量 + 速度 + 取消按钮；成功显示蓝底对号、失败显示红底感叹号，
-  3 秒后自动回到投递形态
-- **贴边缩进**：拖到屏幕边缘先吸附，继续外拖缩成一条边，鼠标悬停自动滑回
-- **细节**：双击卡片打开接收文件夹、右键卡片发送剪贴板文本、同名文件自动改名不覆盖
+```text
+华为分享/
+├── README.md
+├── bin/
+│   ├── hwshare.exe          图形界面（1.88 MB）
+│   └── hwshare-cli.exe      命令行（1.84 MB）
+└── src/
+    ├── Cargo.toml
+    ├── Cargo.lock
+    ├── build.rs             编入图标与版本资源
+    ├── build.ps1            构建 / 测试脚本
+    ├── assets/              图标、版本资源、托盘图标
+    └── src/                 源码
+```
 
-| 传输中 | 成功 | 失败 |
-|---|---|---|
-| ![](images/progress.png) | ![](images/ok.png) | ![](images/fail.png) |
+两个 exe 共用同一份协议实现，功能完全一致，只是入口和子系统不同：
 
-## 运行要求
+| 文件 | 子系统 | 用途 |
+| --- | --- | --- |
+| `hwshare.exe` | Windows GUI | 双击进托盘；不分配控制台，启动时没有黑框 |
+| `hwshare-cli.exe` | Windows CUI | `discover` / `send` / `serve` / `listen` / `--help` |
 
-- **Windows 10（1607 及以上）/ Windows 11，64 位**
-- 不支持：Windows 7 / 8.1（缺少 `GetDpiForSystem` 等系统 API，加载即失败）、
-  32 位 Windows（产物是 PE32+ x64）、Windows XP
-- 不需要 .NET / WebView2 / VC++ 运行库，不写注册表，不需要管理员权限
+静态链接，**不需要安装 Rust 或任何运行时**。
 
-## 快速开始
+---
 
-1. 从 [Releases](../../releases) 下载 `华为分享.exe`，双击运行 —— 托盘图标会出现，同时自动弹出投递窗口
-2. 手机上打开「华为分享」（下拉控制中心，或用文件管理选中文件后点分享），保持亮屏
-3. **收文件**：手机在分享面板里选中电脑名 → 发送
-   **发文件**：双击托盘图标弹出投递卡 → 把文件拖进去
-4. 第一次运行会弹 Windows 防火墙提示，点**允许访问**（UDP/TCP 5684）
-5. 发文件前先在托盘右键菜单 →「发送目标」里选一次手机（只有一台手机在线时会自动选上）
+## 直接使用
+
+双击 `bin\hwshare.exe`。窗口不会出现，程序常驻右下角托盘，同时开始监听，无需任何配置。
+
+托盘右键菜单：
+
+- 顶部是已发现的设备，点一下设为发送目标；选中项会置顶
+- **重新扫描局域网** / **清除选择（不指定目标）**
+- **发送文件到手机** / **发送剪贴板文本**
+- **打开接收文件夹** / **选择接收文件夹…**
+- **开机自启动**：勾选即开启，写当前用户注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，
+  不需要管理员权限；在「任务管理器 → 启动」里手动关掉后，这边菜单也会同步变成未勾选
+- **关于** / **退出**
+
+### 浮窗
+
+发送或接收时右侧会出现一个浮窗，显示进度与结果：
+
+- 可以拖动；拖到屏幕边缘会自动缩进贴边，只留一条 4px 的边
+- 位置会被记住（存在 `window.json`），下次启动回到原处
+- 上次退出时是贴边状态的话，启动后先完整显示 3 秒，再播一次缩进动画收成一条边
+- 贴边状态下鼠标靠近会自动滑出，移开再缩回
+
+### 接收方操作
+
+手机 / 平板打开「华为分享」，保持亮屏，与本机连同一个 Wi-Fi。文件默认落到
+`%USERPROFILE%\Downloads\HWShare`。
+
+---
+
+## 命令行
+
+```text
+hwshare-cli discover [--seconds N]                 扫描局域网设备（默认 12 秒）
+hwshare-cli send --to <IP[:端口]> <文件...>          发给指定设备，端口可自动探测
+hwshare-cli send --to-all <文件...>                 发给所有已发现设备
+hwshare-cli serve [--dest 目录] [--name 名称] [--port 5684] [--no-discovery]
+hwshare-cli listen [--dest 目录] [--port 0]         只接收一次
+hwshare-cli --help
+```
+
+`serve` 是常驻接收（UDP 广播 + TCP 监听），`listen` 收一次就退出。
+默认端口 5684，`--name` 缺省取计算机名 `COMPUTERNAME`。
+
+---
 
 ## 从源码构建
 
-需要 Rust 工具链（MSVC 或 GNU 均可）。`build.rs` 用 `windres` 编译图标与版本资源，
-没有的话产物只是没图标，构建不会失败。
+需要：
 
-```bash
+- **Rust** stable 工具链（`x86_64-pc-windows-gnu` 或 `x86_64-pc-windows-msvc` 均可）
+- **windres**（可选，来自 w64devkit 或任意 mingw-w64）。缺了也能构建，只是 exe 没有图标和版本号
+
+```powershell
 cd src
-cargo build --release --no-default-features --bin hwshare
-# 产物：src/target/release/hwshare.exe
+.\build.ps1            # release 构建，产物复制到 ..\bin\
+.\build.ps1 -Test      # 单元测试
+.\build.ps1 -Offline   # 只用本地 registry 缓存
 ```
 
-Windows 上也可以直接双击根目录的 `构建.bat`。
+脚本会自动寻找 `cargo` 和 `windres`，顺序是：环境变量覆盖（`HWSHARE_CARGO` / `HWSHARE_WINDRES`）
+→ `PATH` → 常见安装目录。
 
-`--no-default-features` 关掉诊断采集（`diag`），这是发布版的构建方式；
-开发调试用 `cargo build --release`（默认带采集埋点）。
+也可以直接用 cargo：
 
-## 项目结构
-
-```
-├─ 华为分享.exe          成品（发布版，1.9 MB）
-├─ 构建.bat              一键构建
-├─ images/               README 用的界面截图
-└─ src/                  Rust 源码
-   ├─ Cargo.toml
-   ├─ build.rs           把图标与版本资源编进 exe
-   ├─ assets/            图标、版本资源
-   └─ src/               32 个模块：发现 / 认证 / 通道 / DFile 传输 / 托盘与浮窗 UI
+```powershell
+cargo build --release --bin hwshare --bin hwshare-cli
+cargo test --lib
 ```
 
-## 常见问题
+### 两个构建注意事项
 
-**手机上看不到电脑？**
-确认两端在同一网段（很多路由器的「访客网络」会隔离设备）、电脑防火墙放行 5684、
-手机华为分享开关处于打开状态。分享面板只显示 10 分钟，超时要重新打开。
+1. **target 目录不要放在中文路径下。** mingw 的 `ld` 打不开非 ASCII 路径里的中间 `.o` 文件，
+   会对每个目标报 `No such file or directory`。`build.ps1` 默认把 target 放到
+   `%LOCALAPPDATA%\HWShareWin\build`，可用 `HWSHARE_TARGET_DIR` 覆盖。
+2. **别给 `build.ps1` 加 `2>&1`。** 脚本里 `$ErrorActionPreference = 'Stop'`，cargo 往 stderr
+   打一行 `Compiling ...` 就会被 PowerShell 当成 `NativeCommandError` 中止。
 
-**收文件时卡在 0%？**
-先看手机是否锁屏。传输中锁屏或切走，手机会停止发送，程序会在 8 秒静默后判定中断
-（`HWSHARE_IDLE_SECS` 可调）。
+---
 
-**双击 exe 提示「Windows 已保护你的电脑」？**
-当前版本未做代码签名，SmartScreen 对陌生程序会拦一次：点「更多信息」→「仍要运行」。
+## 运行时数据
 
-**杀软报毒？**
-未签名 + 自实现网络协议 + 写文件，容易被启发式规则误报。源码全在这里，可自行构建。
+全部在 `%LOCALAPPDATA%\HWShareWin\`：
 
-## 已知限制
+| 文件 | 内容 |
+| --- | --- |
+| `config.json` | 接收目录、分块大小 |
+| `window.json` | 浮窗位置与贴边方向 |
+| `hwshare.log` | 运行日志（超过 1 MB 轮转为 `.1`） |
+| `transfers.log` | 收发记录 |
+| `Huawei\identity.pem` | 本机身份密钥，首次运行自动生成 |
+| `sessions\` | 协议采集，仅在设置 `HWSHARE_TRACE=1` 时产生 |
 
-- 手机端分享可见性只有 10 分钟，超时后需要重新打开
-- 剪贴板只支持纯文本
-- 传输中断会丢弃 `.part` 临时文件，不支持断点续传
-- 只在 HarmonyOS 7 的 MRT-AL10 上做过完整真机验证，其它机型未覆盖
+---
 
-## 许可证
+## 排障
 
-[GPL-3.0](LICENSE)。使用时请遵守当地法律与华为的服务条款。
+| 现象 | 检查 |
+| --- | --- |
+| 菜单里没有设备 | 手机是否打开了「华为分享」、是否同一 Wi-Fi、防火墙是否放行 UDP 5684 |
+| 发送失败 | 看 `hwshare.log` 末尾；设备列表里的 IP:端口 是否可达 |
+| 接收目录不对 | 托盘菜单「选择接收文件夹…」，或直接改 `config.json` 的 `dest` |
+| 开机自启动不生效 | 托盘菜单里该项应显示为已勾选；若显示「路径已变更」，说明 exe 被移动过，点一下修复 |
+
+调试用的环境变量见 `src/src/bin/shared/app.rs` 的 `--help` 文本与 `trace.rs`，
+常用的只有 `HWSHARE_DEBUG=1`（详细日志）和 `HWSHARE_TRACE=1`（协议采集）。
+
+---
+
+## 许可
+
+GPL-3.0-only。协议实现参考了公开的逆向分析资料；本项目与华为、Apple 均无关联。

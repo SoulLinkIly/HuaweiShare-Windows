@@ -8,8 +8,18 @@ use serde_json::Value;
 use crate::{Error, Result};
 
 pub const PORT: u16 = 5684;
-pub const MULTICAST: &str = "224.0.0.1";
-pub const SHARE_CAPABILITY: u64 = 256;
+pub const MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 1);
+
+static SCAN_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn request_scan() {
+    SCAN_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn take_scan_request() -> bool {
+    SCAN_NOW.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+pub const SHARE_CAPABILITY_BIT: u64 = 256;
 
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -26,34 +36,101 @@ pub fn is_discovery_packet(data: &[u8]) -> bool {
     data.len() >= 32 && data.windows(15).any(|w| w == b"device_discover")
 }
 
-pub fn advertisement(local_ip: &str, port: u16, identity: &str, name: &str, discovering: bool) -> Vec<u8> {
+pub fn discovery_beacon(local_ip: &str, port: u16, identity: &str, name: &str, discovering: bool) -> Vec<u8> {
+    let seq_no = (rand::random::<u16>()) as u32;
+    let device_id = format!(r#"{{"UDID":"{identity}"}}"#);
+    let mode = if discovering { 1 } else { 10 };
+
+    let mut json = if discovering {
+        format!(
+            concat!(
+                r#"{{"deviceId":{},"devicename":{},"type":{},"hicomversion":"","mode":{},"#,
+                r#""deviceHash":"","serviceData":"port:{},","extendServiceData":"summary:{},nbVer:9,OH:1,icon:1,abl:31,rssi:-58","#,
+                r#""wlanIp":"{}","capabilityBitmap":[{}],"bType":5,"seqNo":{}"#
+            ),
+            json_string(&device_id),
+            json_string(&truncate(name, 60)),
+            DEVICE_TYPE_PC,
+            mode,
+            port,
+            summary_hex(identity),
+            local_ip,
+            CAPABILITY_BITS,
+            seq_no
+        )
+    } else {
+        format!(
+            concat!(
+                r#"{{"deviceId":{},"devicename":{},"type":{},"hicomversion":"","mode":{},"#,
+                r#""deviceHash":"","serviceData":"port:{},","extendServiceData":"osType:2,nbVer:9,rssi:-58,abl:8","#,
+                r#""wlanIp":"{}","capabilityBitmap":[{}],"bType":5,"seqNo":{}"#
+            ),
+            json_string(&device_id),
+            json_string(&truncate(name, 60)),
+            DEVICE_TYPE_PC,
+            mode,
+            port,
+            local_ip,
+            CAPABILITY_BITS,
+            seq_no
+        )
+    };
+    json.push('}');
+
+    let mut out = Vec::with_capacity(32 + json.len());
+    if discovering {
+        out.extend_from_slice(&[0x50, 0x02]);
+        out.extend_from_slice(&(rand::random::<u16>()).to_be_bytes());
+        push_option(&mut out, 3, local_ip.as_bytes());
+        push_option(&mut out, 8, b"device_discover");      
+        out.push(0xFF);
+    } else {
+        let mut token = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut token);
+        out.extend_from_slice(&[0x42, 0x02]);
+        out.extend_from_slice(&token);
+        out.extend_from_slice(&[0xBD, 0x02]);
+        out.extend_from_slice(b"device_discover");
+        out.extend_from_slice(&[0x11, 0x32]);
+        out.push(0xFF);
+    }
+    out.extend_from_slice(json.as_bytes());
+    crate::trace::discovery_build(local_ip, port, name, DEVICE_TYPE_PC);
+    out
+}
+
+fn push_option(out: &mut Vec<u8>, delta: u8, value: &[u8]) {
+    let len = value.len();
+    if len < 13 {
+        out.push((delta << 4) | len as u8);
+    } else {
+        out.push((delta << 4) | 13);
+        out.push((len - 13) as u8);
+    }
+    out.extend_from_slice(value);
+}
+
+pub fn advertisement_query_harmony(local_ip: &str, port: u16, identity: &str, name: &str) -> Vec<u8> {
     let mut token = [0u8; 4];
     rand::rngs::OsRng.fill_bytes(&mut token);
     let seq_no = (rand::random::<u16>()) as u32;
-
     let device_id = format!(r#"{{"UDID":"{identity}"}}"#);
-    let mode = if discovering { 1 } else { 10 };
-    let mut json = format!(
+    let json = format!(
         concat!(
-
-            r#"{{"deviceId":{},"devicename":{},"type":{},"hicomversion":"","mode":{},"#,
-
+            r#"{{"deviceId":{},"devicename":{},"type":{},"hicomversion":"","mode":1,"#,
             r#""deviceHash":"","serviceData":"port:{},","extendServiceData":"osType:2,nbVer:9,rssi:-58,abl:8","#,
-            r#""wlanIp":"{}","capabilityBitmap":[{}],"bType":5,"seqNo":{}"#
+            r#""wlanIp":"{}","capabilityBitmap":[{}],"bType":5,"seqNo":{},"#,
+            r#""coapUri":"coap://{}/device_discover""#
         ),
         json_string(&device_id),
         json_string(&truncate(name, 60)),
-        device_type(),
-        mode,
+        DEVICE_TYPE_PC,
         port,
         local_ip,
-        capability_bits(),
-        seq_no
-    );
-    if discovering {
-        json.push_str(&format!(r#","coapUri":"coap://{local_ip}:5684/device_discover""#));
-    }
-    json.push('}');
+        CAPABILITY_BITS,
+        seq_no,
+        local_ip
+    ) + "}";
 
     let mut out = Vec::with_capacity(32 + json.len());
     out.extend_from_slice(&[0x42, 0x02]);
@@ -63,24 +140,19 @@ pub fn advertisement(local_ip: &str, port: u16, identity: &str, name: &str, disc
     out.extend_from_slice(&[0x11, 0x32]);
     out.push(0xFF);
     out.extend_from_slice(json.as_bytes());
-    crate::trace::discovery_build(local_ip, port, name, device_type());
     out
 }
 
-fn capability_bits() -> u64 {
-    std::env::var("HWSHARE_CAPA")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(455)
+fn summary_hex(identity: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(identity.as_bytes());
+    hasher.finalize().iter().map(|b| format!("{b:02X}")).collect()
 }
 
-fn device_type() -> u32 {
-    std::env::var("HWSHARE_TYPE")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|n| *n <= 255)
-        .unwrap_or(12)
-}
+const CAPABILITY_BITS: u64 = 455;
+
+const DEVICE_TYPE_PC: u32 = 12;
 
 fn truncate(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
@@ -146,7 +218,7 @@ fn parse_options(data: &[u8]) -> Result<(usize, HashMap<u64, Vec<u8>>)> {
     Ok((offset, options))
 }
 
-pub fn decode_advertisement(data: &[u8], host: &str, local_network: Ipv4Addr, local_prefix: u8) -> Result<(Peer, bool, [u8; 2])> {
+pub fn parse_discovery_beacon(data: &[u8], host: &str, local_network: Ipv4Addr, local_prefix: u8) -> Result<(Peer, bool, [u8; 2])> {
     let src: Ipv4Addr = host.parse().map_err(|_| Error::Format)?;
     if src == local_network || !same_subnet(src, local_network, local_prefix) {
         return Err(Error::Protocol("源地址不在本网段".into()));
@@ -201,8 +273,7 @@ pub fn decode_advertisement(data: &[u8], host: &str, local_network: Ipv4Addr, lo
         Some(17) => "tablet",
         _ => "unknown",
     };
-
-    if first_cap & SHARE_CAPABILITY == 0 && !matches!(kind, "phone" | "tablet") {
+    if first_cap & SHARE_CAPABILITY_BIT == 0 && !matches!(kind, "phone" | "tablet") {
         return Err(Error::Protocol("对端未声明分享能力".into()));
     }
 
@@ -260,14 +331,14 @@ impl DiscoverySocket {
         socket
             .set_read_timeout(Some(Duration::from_millis(400)))
             .map_err(|e| Error::Io(e.to_string()))?;
-        let _ = socket.join_multicast_v4(&MULTICAST.parse().unwrap(), &local_ip);
+        let _ = socket.join_multicast_v4(&MULTICAST, &local_ip);
         Ok(Self { socket, local_ip })
     }
 
-    pub fn send(&self, target: &str, data: &[u8]) -> Result<()> {
+    pub fn transmit(&self, target: &str, data: &[u8]) -> Result<()> {
         let dest = match target {
             "broadcast" => SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), PORT),
-            "multicast" => SocketAddr::new(MULTICAST.parse().unwrap(), PORT),
+            "multicast" => SocketAddr::new(IpAddr::V4(MULTICAST), PORT),
             ip => SocketAddr::new(ip.parse().map_err(|_| Error::Argument)?, PORT),
         };
         self.socket
@@ -298,26 +369,30 @@ mod tests {
     fn keepalive_packet_is_not_discovery() {
         assert!(!is_discovery_packet(&[0x60, 0x00, 0xF5, 0x8E]));
         assert!(!is_discovery_packet(&[]));
-
-        let pkt = advertisement("192.168.1.5", 41234, "AABB", "PC", true);
+        let pkt = discovery_beacon("192.168.1.5", 41234, "AABB", "PC", true);
         assert!(is_discovery_packet(&pkt));
-        let answer = advertisement("192.168.1.5", 41234, "AABB", "PC", false);
+        let answer = discovery_beacon("192.168.1.5", 41234, "AABB", "PC", false);
         assert!(is_discovery_packet(&answer));
-
         assert!(!is_discovery_packet(&vec![0u8; 100]));
     }
 
     #[test]
     fn advertisement_shape() {
-        let pkt = advertisement("192.168.1.5", 41234, "AABBCCDDEEFF", "我的电脑", true);
-        assert_eq!(&pkt[0..2], &[0x42, 0x02]);
-        assert!(pkt.windows(15).any(|w| w == b"device_discover"));
-        assert_eq!(*pkt.last().unwrap(), b'}');
-        let text = String::from_utf8_lossy(&pkt);
+        let query = discovery_beacon("192.168.1.5", 41234, "AABBCCDDEEFF", "我的电脑", true);
+        assert_eq!(&query[0..2], &[0x50, 0x02]);
+        assert!(query.windows(15).any(|w| w == b"device_discover"));
+        assert_eq!(*query.last().unwrap(), b'}');
+        let text = String::from_utf8_lossy(&query);
         assert!(text.contains(r#""wlanIp":"192.168.1.5""#));
         assert!(text.contains(r#""mode":1"#));
-
+        assert!(text.contains("summary:"));
         assert!(text.contains(r#""type":12"#));
+
+        let answer = discovery_beacon("192.168.1.5", 41234, "AABBCCDDEEFF", "我的电脑", false);
+        assert_eq!(&answer[0..2], &[0x42, 0x02]);
+        let text = String::from_utf8_lossy(&answer);
+        assert!(text.contains(r#""mode":10"#));
+        assert!(text.contains("osType:2"));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
-static DEST: Mutex<Option<PathBuf>> = Mutex::new(None);
+static DEST: Mutex<Option<(Option<SystemTime>, PathBuf)>> = Mutex::new(None);
 
 const CHUNK_MIN: usize = 512;
 const CHUNK_MAX: usize = 65535;
@@ -34,15 +35,22 @@ fn load_from_disk() -> Option<PathBuf> {
     parse_dest(&std::fs::read_to_string(config_path()?).ok()?)
 }
 
+fn config_mtime() -> Option<SystemTime> {
+    std::fs::metadata(config_path()?).ok()?.modified().ok()
+}
+
 pub fn current() -> PathBuf {
+    let mtime = config_mtime();
     if let Ok(slot) = DEST.lock() {
-        if let Some(path) = slot.as_ref() {
-            return path.clone();
+        if let Some((cached, path)) = slot.as_ref() {
+            if *cached == mtime {
+                return path.clone();
+            }
         }
     }
     let loaded = load_from_disk().unwrap_or_else(default_dest);
     if let Ok(mut slot) = DEST.lock() {
-        *slot = Some(loaded.clone());
+        *slot = Some((mtime, loaded.clone()));
     }
     loaded
 }
@@ -70,7 +78,6 @@ fn write_config(dest: &str) -> std::io::Result<()> {
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     object.insert("dest".to_string(), serde_json::Value::String(dest.to_string()));
-
     let text = serde_json::Value::Object(object).to_string();
     let tmp = cfg.with_extension("json.tmp");
     std::fs::write(&tmp, text)?;
@@ -80,10 +87,11 @@ fn write_config(dest: &str) -> std::io::Result<()> {
 }
 
 pub fn set_dest(path: &Path) -> std::io::Result<()> {
+    let result = write_config(&path.display().to_string());
     if let Ok(mut slot) = DEST.lock() {
-        *slot = Some(path.to_path_buf());
+        *slot = Some((config_mtime(), path.to_path_buf()));
     }
-    write_config(&path.display().to_string())
+    result
 }
 
 #[cfg(test)]
@@ -107,9 +115,8 @@ mod tests {
     fn parse_chunk_respects_range() {
         assert_eq!(parse_chunk(r#"{"chunk":32768}"#), Some(32768));
         assert_eq!(parse_chunk(r#"{"dest":"D:\\x","chunk":1422}"#), Some(1422));
-
         assert_eq!(parse_chunk(r#"{"chunk":511}"#), None);
-        assert_eq!(parse_chunk(r#"{"chunk":65536}"#), None);
+        assert_eq!(parse_chunk(r#"{"chunk":65536}"#), None);  
         assert_eq!(parse_chunk(r#"{"chunk":"32768"}"#), None);
         assert_eq!(parse_chunk(r#"{"dest":"D:\\x"}"#), None);
     }

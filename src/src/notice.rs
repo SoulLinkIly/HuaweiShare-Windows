@@ -1,4 +1,5 @@
 #![cfg(windows)]
+
 use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
@@ -58,7 +59,14 @@ static FONT_TITLE: AtomicIsize = AtomicIsize::new(0);
 static FONT_BODY: AtomicIsize = AtomicIsize::new(0);
 static FONT_BTN: AtomicIsize = AtomicIsize::new(0);
 
+static SHOW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn show(title: &str, body: &str) -> bool {
+    let _guard = match SHOW_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
     crate::tray::enable_dpi_awareness();
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());

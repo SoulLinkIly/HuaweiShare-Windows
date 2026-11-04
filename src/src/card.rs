@@ -1,11 +1,12 @@
 #![cfg(windows)]
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU8, Ordering};
+
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush,
-    DeleteObject, DrawTextW, Ellipse, EndPaint, ExtCreatePen, FillRect, GetStockObject,
+    DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, ExtCreatePen, FillRect, GetStockObject,
     Polygon, Polyline, RoundRect, SelectObject, SetBkMode, SetTextColor,
     ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
     DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE,
@@ -44,19 +45,15 @@ const COL_BG: u32 = 0x00FF_FFFF;
 const COL_MAIN: u32 = 0x001A_1A1A;
 const COL_SUB: u32 = 0x0093_8E8E;
 const COL_TRACK: u32 = 0x00EA_E5E5;
-
 const COL_BTN_BG: u32 = 0x00E1_DDF9;
 const COL_BTN_TEXT: u32 = 0x007A_70C2;
 const COL_BTN_HOVER_BG: u32 = 0x00EA_E7FC;
 const COL_ACCENT: u32 = 0x00FF_7A00;
-
 const COL_ERROR: u32 = 0x0030_3BFF;
-
 const COL_MEDIA: u32 = 0x0035_C734;
 const COL_FILE_BODY: u32 = 0x00F6_F5F7;
 const COL_FILE_LINE: u32 = 0x00D6_D4DA;
 const COL_ASK: u32 = 0x0078_747D;
-
 const COL_ICON_BG: u32 = 0x00FF_F2EA;
 const COL_BORDER: u32 = 0x00E6_E2E9;
 const COL_HINT: u32 = 0x00B4_B0B8;
@@ -76,63 +73,45 @@ const IDC_ARROW: usize = 32512;
 const SW_SHOWNOACTIVATE: i32 = 4;
 const SW_HIDE: i32 = 0;
 const TIMER_ID: usize = 1;
-
 const ANIM_TIMER: usize = 2;
-
 const ANIM_MS: u32 = 300;
-
 const ANIM_IN_PART: f32 = 0.35;
+const RESTORE_HOLD_MS: u32 = 3000;
 
 static STATE: AtomicU8 = AtomicU8::new(0);
-
 static MODE: AtomicU8 = AtomicU8::new(0);
-
 static PINNED: AtomicBool = AtomicBool::new(false);
 static PCT: AtomicU32 = AtomicU32::new(0);
-static RECEIVED: AtomicU32 = AtomicU32::new(0);
-static TOTAL: AtomicU32 = AtomicU32::new(0);
-
+static RECEIVED: AtomicU64 = AtomicU64::new(0);
+static TOTAL: AtomicU64 = AtomicU64::new(0);
 static SPEED_KB: AtomicU32 = AtomicU32::new(0);
 static NAME: Mutex<String> = Mutex::new(String::new());
 static DONE_AT: AtomicU32 = AtomicU32::new(0);
-
 static MEDIA: AtomicBool = AtomicBool::new(false);
-
 static MULTI: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicU8 = AtomicU8::new(0);
 static DPI: AtomicU32 = AtomicU32::new(96);
-
 static LAST_MS: AtomicU32 = AtomicU32::new(0);
-
 static LAST_STATE: AtomicU8 = AtomicU8::new(u8::MAX);
 static LAST_PCT: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_SPEED: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_MODE: AtomicU8 = AtomicU8::new(u8::MAX);
-
 static OUTGOING: AtomicBool = AtomicBool::new(false);
-
 static CANCELED: AtomicBool = AtomicBool::new(false);
-
 static HOVER_CANCEL: AtomicBool = AtomicBool::new(false);
-
 static TUCKED: AtomicU8 = AtomicU8::new(0);
-
+static STARTUP_RESTORE: AtomicBool = AtomicBool::new(false);
+static RESTORE_TUCK_AT: AtomicU32 = AtomicU32::new(0);
 static FADE: AtomicU32 = AtomicU32::new(255);
-
 static FADE_TO: AtomicU32 = AtomicU32::new(255);
-
 static VISIBLE: AtomicBool = AtomicBool::new(false);
-
 static PENDING_SWITCH: AtomicU8 = AtomicU8::new(0);
-
 static LAST_ALPHA: AtomicU32 = AtomicU32::new(u32::MAX);
-
 const FADE_STEP: u32 = 42;
 
 static ANIM_ON: AtomicBool = AtomicBool::new(false);
 static ANIM_T0: AtomicU32 = AtomicU32::new(0);
 static ANIM_EDGE: AtomicU8 = AtomicU8::new(0);
-
 static ANIM_FROM: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
 static ANIM_FULL: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
 static ANIM_REST: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
@@ -140,7 +119,9 @@ static CANVAS_DC: AtomicIsize = AtomicIsize::new(0);
 static CANVAS_BITS: AtomicIsize = AtomicIsize::new(0);
 static WIN_POS: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
 static WIN_SIZE: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
-static LAST_RX: AtomicU32 = AtomicU32::new(0);
+static LAST_RX: AtomicU64 = AtomicU64::new(0);
+static TARGET_VIEW: Mutex<Option<crate::peers::TargetView>> = Mutex::new(None);
+static LAST_TARGET_REV: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn now_ms() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -214,9 +195,9 @@ pub fn update(received: u64, total: u64) {
     if STATE.load(Ordering::SeqCst) != 1 {
         return;
     }
-    let rx = received.min(u32::MAX as u64) as u32;
+    let rx = received;
     RECEIVED.store(rx, Ordering::SeqCst);
-    TOTAL.store(total.min(u32::MAX as u64) as u32, Ordering::SeqCst);
+    TOTAL.store(total, Ordering::SeqCst);
     if total > 0 {
         PCT.store(
             (received as f64 * 10000.0 / total as f64).min(10000.0) as u32,
@@ -228,8 +209,7 @@ pub fn update(received: u64, total: u64) {
     let dt = now.wrapping_sub(LAST_MS.load(Ordering::SeqCst));
     if dt >= 500 {
         let last_rx = LAST_RX.load(Ordering::SeqCst);
-        let db = rx.saturating_sub(last_rx) as u64;
-
+        let db = rx.saturating_sub(last_rx);
         let kb = (db / dt.max(1) as u64).min(u32::MAX as u64) as u32;
         SPEED_KB.store(kb, Ordering::SeqCst);
         LAST_MS.store(now, Ordering::SeqCst);
@@ -256,11 +236,9 @@ pub fn fail() {
 
 pub fn hide() {
     let state = STATE.load(Ordering::SeqCst);
-
     if state == 2 || state == 4 {
         return;
     }
-
     if PINNED.load(Ordering::SeqCst) {
         DONE_AT.store(0, Ordering::SeqCst);
         MODE.store(1, Ordering::SeqCst);
@@ -299,11 +277,24 @@ unsafe fn run_card() {
     DPI.store(dpi as u32, Ordering::SeqCst);
     let cw = CARD_W * dpi / 96;
     let ch = CARD_H * dpi / 96;
-
-    let (x, y) = crate::float::initial_pos(cw, ch, dpi);
+    let (x, y, restore_edge) = match crate::float::load_layout() {
+        Some(layout) if layout.edge != crate::float::Edge::None => {
+            let (x, y) = crate::float::expanded_pos(layout.edge, layout.x, layout.y, cw, ch);
+            (x, y, layout.edge)
+        }
+        Some(layout) => {
+            let (x, y) = crate::float::clamp_to_work_area(layout.x, layout.y, cw, ch);
+            (x, y, crate::float::Edge::None)
+        }
+        None => {
+            let (x, y) = crate::float::initial_pos(cw, ch, dpi);
+            (x, y, crate::float::Edge::None)
+        }
+    };
+    TUCKED.store(restore_edge.code(), Ordering::SeqCst);
+    STARTUP_RESTORE.store(restore_edge != crate::float::Edge::None, Ordering::SeqCst);
 
     let hwnd = CreateWindowExW(
-
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         class.as_ptr(),
         std::ptr::null(),
@@ -321,7 +312,6 @@ unsafe fn run_card() {
         STARTED.store(2, Ordering::SeqCst);
         return;
     }
-
     DragAcceptFiles(hwnd, 1);
 
     let screen = windows_sys::Win32::Graphics::Gdi::GetDC(std::ptr::null_mut());
@@ -357,6 +347,15 @@ unsafe fn run_card() {
     }
     KillTimer(hwnd, TIMER_ID);
     DestroyWindow(hwnd);
+
+    let canvas = CANVAS_DC.swap(0, Ordering::SeqCst);
+    if canvas != 0 {
+        DeleteDC(canvas as _);
+    }
+    if !dib.is_null() {
+        DeleteObject(dib as _);
+    }
+    CANVAS_BITS.store(0, Ordering::SeqCst);
 }
 
 fn corner_alpha(x: i32, y: i32, w: i32, h: i32, r: i32) -> u8 {
@@ -436,7 +435,6 @@ unsafe fn commit(hwnd: HWND) {
     let blend = BLENDFUNCTION {
         BlendOp: 0,
         BlendFlags: 0,
-
         SourceConstantAlpha: 255,
         AlphaFormat: 1,
     };
@@ -509,6 +507,7 @@ unsafe fn tuck_tick(hwnd: HWND) {
         || crate::float::is_dragging()
         || ANIM_ON.load(Ordering::SeqCst)
         || STATE.load(Ordering::SeqCst) == 0
+        || RESTORE_TUCK_AT.load(Ordering::SeqCst) != 0
     {
         return;
     }
@@ -520,7 +519,6 @@ unsafe fn tuck_tick(hwnd: HWND) {
     );
     let (mx, my) = crate::float::cursor();
     let inside = mx >= x && mx < x + w && my >= y && my < y + h;
-
     let peek = crate::float::PEEK;
     let want = if inside {
         crate::float::expanded_pos(edge, x, y, w, h)
@@ -530,7 +528,7 @@ unsafe fn tuck_tick(hwnd: HWND) {
     if want != (x, y) {
         move_to(hwnd, want.0, want.1);
         if inside {
-            crate::float::remember(want.0, want.1);
+            crate::float::save_layout(want.0, want.1, edge);
         }
     }
 }
@@ -545,9 +543,17 @@ unsafe fn finish_drag(hwnd: HWND) {
         WIN_POS[1].load(Ordering::SeqCst),
     );
     if edge == crate::float::Edge::None {
-        crate::float::remember(x, y);
+        crate::float::save_layout(x, y, crate::float::Edge::None);
         return;
     }
+    start_tuck_anim(hwnd, edge, x, y);
+    let expanded = crate::float::expanded_pos(edge, x, y, w, h);
+    crate::float::save_layout(expanded.0, expanded.1, edge);
+}
+
+unsafe fn start_tuck_anim(hwnd: HWND, edge: crate::float::Edge, x: i32, y: i32) {
+    let w = WIN_SIZE[0].load(Ordering::SeqCst);
+    let h = WIN_SIZE[1].load(Ordering::SeqCst);
     let peek = crate::float::PEEK;
     let full = crate::float::tucked_pos(edge, x, y, w, h, 0);
     let rest = crate::float::tucked_pos(edge, x, y, w, h, peek);
@@ -561,8 +567,34 @@ unsafe fn finish_drag(hwnd: HWND) {
     ANIM_T0.store(now_ms(), Ordering::SeqCst);
     ANIM_ON.store(true, Ordering::SeqCst);
     SetTimer(hwnd, ANIM_TIMER, 16, None);
-    let expanded = crate::float::expanded_pos(edge, x, y, w, h);
-    crate::float::remember(expanded.0, expanded.1);
+}
+
+fn arm_restore_tuck() {
+    let due = now_ms().wrapping_add(RESTORE_HOLD_MS);
+    RESTORE_TUCK_AT.store(if due == 0 { 1 } else { due }, Ordering::SeqCst);
+}
+
+fn restore_tuck_due() -> bool {
+    let at = RESTORE_TUCK_AT.load(Ordering::SeqCst);
+    at != 0 && now_ms().wrapping_sub(at) < 0x8000_0000
+}
+
+fn cancel_restore_tuck() {
+    RESTORE_TUCK_AT.store(0, Ordering::SeqCst);
+}
+
+unsafe fn start_restore_tuck(hwnd: HWND) {
+    cancel_restore_tuck();
+    let edge = crate::float::Edge::from_code(TUCKED.load(Ordering::SeqCst));
+    if edge == crate::float::Edge::None {
+        return;
+    }
+    let (x, y) = (
+        WIN_POS[0].load(Ordering::SeqCst),
+        WIN_POS[1].load(Ordering::SeqCst),
+    );
+    start_tuck_anim(hwnd, edge, x, y);
+    crate::float::remember(x, y);
 }
 
 fn lerp(a: i32, b: i32, k: f32) -> i32 {
@@ -608,6 +640,7 @@ unsafe fn show_expanded(hwnd: HWND) {
     if ANIM_ON.swap(false, Ordering::SeqCst) {
         KillTimer(hwnd, ANIM_TIMER);
     }
+    cancel_restore_tuck();
     let edge = crate::float::Edge::from_code(TUCKED.swap(0, Ordering::SeqCst));
     if edge == crate::float::Edge::None {
         return;
@@ -620,7 +653,7 @@ unsafe fn show_expanded(hwnd: HWND) {
     );
     let p = crate::float::expanded_pos(edge, x, y, w, h);
     move_to(hwnd, p.0, p.1);
-    crate::float::remember(p.0, p.1);
+    crate::float::save_layout(p.0, p.1, crate::float::Edge::None);
 }
 
 fn request_cancel() {
@@ -825,7 +858,6 @@ unsafe fn draw_fail_badge(hdc: HDC, cx: i32, cy: i32, r: i32, px: &dyn Fn(i32) -
 unsafe fn draw_progress(_hwnd: HWND, state: u8) {
     let done = state == 2;
     let failed = state == 4;
-
     let hdc = CANVAS_DC.load(Ordering::SeqCst) as HDC;
     let (vw, vh) = (
         WIN_SIZE[0].load(Ordering::SeqCst),
@@ -940,7 +972,7 @@ unsafe fn draw_progress(_hwnd: HWND, state: u8) {
     SelectObject(hdc, f1 as _);
     SetTextColor(hdc, if failed { COL_ERROR } else { COL_SUB });
     let sub = if done {
-        format!("已完成 · {}", human(TOTAL.load(Ordering::SeqCst) as u64))
+        format!("已完成 · {}", human(TOTAL.load(Ordering::SeqCst)))
     } else if failed {
         "传输失败".to_string()
     } else {
@@ -951,15 +983,15 @@ unsafe fn draw_progress(_hwnd: HWND, state: u8) {
         } else if sp > 0 {
             format!(
                 "{} / {} · {:.1} MB/s",
-                human(RECEIVED.load(Ordering::SeqCst) as u64),
-                human(TOTAL.load(Ordering::SeqCst) as u64),
+                human(RECEIVED.load(Ordering::SeqCst)),
+                human(TOTAL.load(Ordering::SeqCst)),
                 sp as f64 / 1024.0
             )
         } else {
             format!(
                 "{} / {}",
-                human(RECEIVED.load(Ordering::SeqCst) as u64),
-                human(TOTAL.load(Ordering::SeqCst) as u64)
+                human(RECEIVED.load(Ordering::SeqCst)),
+                human(TOTAL.load(Ordering::SeqCst))
             )
         }
     };
@@ -978,7 +1010,6 @@ unsafe fn draw_progress(_hwnd: HWND, state: u8) {
     } else {
         format!("{:.0}%", PCT.load(Ordering::SeqCst) as f64 / 100.0)
     };
-
     if !pct_text.is_empty() {
         let mut r2 = RECT { left, top: px(62), right, bottom: px(96) };
         let u2: Vec<u16> = pct_text.encode_utf16().collect();
@@ -1039,22 +1070,33 @@ fn lo_word(v: LPARAM) -> i32 {
 }
 
 fn short_name(name: &str) -> String {
-    let tail = name.rsplit('的').next().unwrap_or(name).trim();
-    let base = if tail.is_empty() { name.trim() } else { tail };
-    if base.chars().count() > 16 {
-        let mut t: String = base.chars().take(15).collect();
+    if name.chars().count() > 12 {
+        let mut t: String = name.chars().take(11).collect();
         while t.ends_with(' ') {
             t.pop();
         }
         t.push('…');
         t
     } else {
-        base.to_string()
+        name.to_string()
     }
 }
 
 fn current_target() -> Option<crate::peers::PeerInfo> {
-    crate::peers::selected()
+    let cached = TARGET_VIEW
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|v| v.selected.clone()));
+    cached.or_else(|| crate::peers::selected())
+}
+
+fn refresh_target_view() -> bool {
+    let view = crate::peers::view(std::time::Duration::from_secs(3600));
+    let changed = LAST_TARGET_REV.swap(view.revision, Ordering::SeqCst) != view.revision;
+    if let Ok(mut slot) = TARGET_VIEW.lock() {
+        *slot = Some(view);
+    }
+    changed
 }
 
 fn close_rect(w: i32) -> (i32, i32, i32, i32) {
@@ -1077,6 +1119,7 @@ unsafe fn start_drag(hwnd: HWND) {
     if ANIM_ON.swap(false, Ordering::SeqCst) {
         KillTimer(hwnd, ANIM_TIMER);
     }
+    cancel_restore_tuck();
     let size = (
         WIN_SIZE[0].load(Ordering::SeqCst),
         WIN_SIZE[1].load(Ordering::SeqCst),
@@ -1189,17 +1232,14 @@ unsafe fn draw_drop() {
 
 unsafe fn handle_drop(hdrop: *mut std::ffi::c_void) {
     let count = DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0);
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(count as usize);
+    let mut buf = vec![0u16; 32768];
     for i in 0..count {
-        let len = DragQueryFileW(hdrop, i, std::ptr::null_mut(), 0);
-        if len == 0 {
-            continue;
-        }
-        let mut buf = vec![0u16; len as usize + 1];
         let written = DragQueryFileW(hdrop, i, buf.as_mut_ptr(), buf.len() as u32);
         if written > 0 {
-            buf.truncate(written as usize);
-            paths.push(std::path::PathBuf::from(String::from_utf16_lossy(&buf)));
+            paths.push(std::path::PathBuf::from(String::from_utf16_lossy(
+                &buf[..written as usize],
+            )));
         }
     }
     DragFinish(hdrop);
@@ -1239,6 +1279,12 @@ pub fn hide_drop() {
     STATE.store(0, Ordering::SeqCst);
 }
 
+pub fn show_drop() {
+    if STATE.load(Ordering::SeqCst) == 0 {
+        toggle_drop();
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let _ = wparam;
     match msg {
@@ -1253,6 +1299,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 anim_tick(hwnd);
                 return 0;
             }
+            let target_changed = refresh_target_view();
             let mut state = STATE.load(Ordering::SeqCst);
 
             if state == 2 || state == 4 {
@@ -1265,11 +1312,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
 
             if state != 0 && !VISIBLE.load(Ordering::SeqCst) {
-                show_expanded(hwnd);
+                if STARTUP_RESTORE.swap(false, Ordering::SeqCst) {
+                    arm_restore_tuck();
+                } else {
+                    show_expanded(hwnd);
+                }
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 VISIBLE.store(true, Ordering::SeqCst);
                 FADE.store(0, Ordering::SeqCst);
                 FADE_TO.store(255, Ordering::SeqCst);
+            }
+
+            if restore_tuck_due() {
+                cancel_restore_tuck();
+                if !crate::float::is_dragging()
+                    && MODE.load(Ordering::SeqCst) == 1
+                    && VISIBLE.load(Ordering::SeqCst)
+                    && STATE.load(Ordering::SeqCst) != 0
+                {
+                    start_restore_tuck(hwnd);
+                }
             }
 
             let cur = FADE.load(Ordering::SeqCst);
@@ -1304,7 +1366,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let prev_pct = LAST_PCT.swap(pct, Ordering::SeqCst);
             let prev_sp = LAST_SPEED.swap(sp, Ordering::SeqCst);
             let prev_mode = LAST_MODE.swap(mode, Ordering::SeqCst);
-
             let hover = cursor_hover_hit();
             let prev_hover = HOVER_CANCEL.swap(hover, Ordering::SeqCst);
             let prev_alpha = LAST_ALPHA.swap(next, Ordering::SeqCst);
@@ -1319,6 +1380,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 || prev_hover != hover
                 || prev_mode != mode
                 || prev_alpha != next
+                || target_changed
             {
                 commit(hwnd);
             }
@@ -1338,7 +1400,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 hit_cancel(x, y)
             };
-
             if HOVER_CANCEL.swap(inside, Ordering::SeqCst) != inside {
                 commit(hwnd);
             }

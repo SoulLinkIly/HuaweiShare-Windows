@@ -65,7 +65,7 @@ fn local_offset_secs() -> i64 {
     }
 }
 
-fn summarize(files: &[(String, u64)]) -> String {
+fn describe_transfer(files: &[(String, u64)]) -> String {
     if files.is_empty() {
         return "-".to_string();
     }
@@ -89,6 +89,8 @@ pub fn record(
     let Some(path) = log_path() else {
         return;
     };
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -118,7 +120,7 @@ pub fn record(
         mb,
         secs,
         speed,
-        summarize(files),
+        describe_transfer(files),
         note.replace('\t', " ")
     );
 
@@ -147,7 +149,7 @@ mod tests {
     #[test]
     fn summarize_truncates() {
         let files: Vec<(String, u64)> = (0..8).map(|i| (format!("f{i}.jpg"), 1)).collect();
-        let text = summarize(&files);
+        let text = describe_transfer(&files);
         assert!(text.contains("等 8 个"), "{text}");
     }
 }

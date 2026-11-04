@@ -1,4 +1,5 @@
 #![cfg(windows)]
+
 use std::ffi::c_void;
 use std::sync::OnceLock;
 

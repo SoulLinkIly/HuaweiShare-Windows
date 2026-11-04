@@ -46,15 +46,11 @@ impl Scope {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub path: PathBuf,
-
     pub peer: Option<String>,
-
     pub local: Option<String>,
     pub scope: Scope,
     pub session_id: String,
-
     pub source: String,
-
     pub max_bytes: u64,
 }
 
@@ -185,7 +181,7 @@ pub fn start(cfg: Config) -> std::io::Result<PathBuf> {
         "v": FORMAT_VERSION,
         "ev": "capture.meta",
         "sid": sink.cfg.session_id.clone(),
-        "tool": "HWSHARE_WIRE_FULL",
+        "tool": "hwshare",
         "source": sink.cfg.source.clone(),
         "pid": pid(),
         "wall": now_ms(),
@@ -213,12 +209,11 @@ pub fn init_from_env() {
     if enabled() {
         return;
     }
-    let full = std::env::var("HWSHARE_WIRE_FULL").is_ok();
-    if std::env::var("HWSHARE_TRACE").is_err() && !full {
+    if std::env::var("HWSHARE_TRACE").is_err() {
         return;
     }
     let sid = make_session_id();
-    let default_scope = if full { Scope::Bytes } else { Scope::Frames };
+    let default_scope = Scope::Frames;
     let scope = std::env::var("HWSHARE_TRACE_SCOPE")
         .ok()
         .and_then(|s| Scope::parse(&s))
@@ -232,7 +227,6 @@ pub fn init_from_env() {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let local = std::env::var("HWSHARE_TRACE_LOCAL").ok().filter(|s| !s.is_empty());
-
     let max_bytes = std::env::var("HWSHARE_TRACE_MAX_MB")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -304,7 +298,6 @@ fn emit(ev: &str, peer: Option<&str>, mut fields: Map<String, Value>) {
     let line = Value::Object(fields);
     let _ = sink.out.write_all(line.to_string().as_bytes());
     let _ = sink.out.write_all(b"\n");
-
     let _ = sink.out.flush();
     EVENTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -352,7 +345,6 @@ pub fn classify(data: &[u8]) -> FrameKind {
     if data.len() >= 8 {
         let kind = data[0];
         let size = u16::from_be_bytes([data[6], data[7]]);
-
         if (1..=14).contains(&kind) || kind == 22 {
             if 8 + size as usize == data.len() {
                 return FrameKind::Dfile {
@@ -392,7 +384,6 @@ pub fn session_end(ok: bool, bytes: u64, files: &[String], reason: &str, dur_ms:
     push(&mut f, "files", json!(files));
     push(&mut f, "reason", json!(reason));
     push(&mut f, "dur_ms", json!(dur_ms as u64));
-
     emit("session.end", None, f);
 }
 
@@ -424,7 +415,7 @@ pub fn channel_close(label: &str, tx: u64, rx: u64, dur_ms: u128, reason: &str, 
     emit("channel.close", None, f);
 }
 
-pub fn frame(channel: &str, dir: &str, data: &[u8], conn: u64) {
+pub fn wire_frame(channel: &str, dir: &str, data: &[u8], conn: u64) {
     if !enabled() || scope() < Scope::Frames {
         return;
     }
@@ -457,7 +448,6 @@ pub fn frame(channel: &str, dir: &str, data: &[u8], conn: u64) {
             push(&mut f, "proto", json!("raw"));
         }
     }
-
     let limit = if scope() == Scope::Bytes { data.len() } else { 64 };
     push(&mut f, "hex", json!(hex_text(data, limit)));
     emit("frame", None, f);
@@ -710,7 +700,7 @@ mod tests {
         let path = temp_path("skeleton");
         start_at(&path, None, Scope::Skeleton);
         session_start("recv", "10.0.0.2", "10.0.0.1", 1, 10);
-        frame("file#1", "rx", &[8, 0, 0, 0, 0, 0, 0, 0], 1);
+        wire_frame("file#1", "rx", &[8, 0, 0, 0, 0, 0, 0, 0], 1);
         bytes("file#1", "rx", b"xyz", 1);
         note("control", "hello");
         finish("test");
@@ -773,7 +763,7 @@ mod tests {
         let path = temp_path("limit");
         start_with(&path, None, Scope::Bytes, 100);
         bytes("control", "rx", &[1u8; 60], 1);
-        bytes("control", "rx", &[2u8; 60], 1);
+        bytes("control", "rx", &[2u8; 60], 1); 
         bytes("control", "rx", &[3u8; 60], 1);
         finish("test");
         let all = lines(&path);

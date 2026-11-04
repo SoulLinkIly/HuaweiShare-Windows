@@ -1,4 +1,5 @@
 #![cfg(windows)]
+
 use std::ffi::c_void;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, SIZE};
@@ -39,6 +40,12 @@ impl Canvas {
         let mem = CreateCompatibleDC(screen);
         ReleaseDC(std::ptr::null_mut(), screen);
         if dib.is_null() || mem.is_null() || bits.is_null() {
+            if !mem.is_null() {
+                windows_sys::Win32::Graphics::Gdi::DeleteDC(mem);
+            }
+            if !dib.is_null() {
+                windows_sys::Win32::Graphics::Gdi::DeleteObject(dib as _);
+            }
             return None;
         }
         SelectObject(mem, dib);
@@ -88,13 +95,13 @@ impl Canvas {
     }
 
     pub unsafe fn destroy(&mut self) {
-        if !self.dib.is_null() {
-            windows_sys::Win32::Graphics::Gdi::DeleteObject(self.dib as _);
-            self.dib = std::ptr::null_mut();
-        }
         if !self.mem.is_null() {
             windows_sys::Win32::Graphics::Gdi::DeleteDC(self.mem);
             self.mem = std::ptr::null_mut();
+        }
+        if !self.dib.is_null() {
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(self.dib as _);
+            self.dib = std::ptr::null_mut();
         }
     }
 }
