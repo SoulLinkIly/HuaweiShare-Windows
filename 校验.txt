@@ -1,6 +1,6 @@
 华为分享 1.8.0 · 成品校验
 
-版本：1.8.0（第一个对外发布版本）
+版本：1.8.0（最新重构版本）
 构建：2026-11-07，`src\build.ps1`（Rust stable x86_64-pc-windows-gnu，release，panic=abort，strip）
 验证：cargo test = 202 单元 + 6 回环，release 零警告
 版本资源：FileVersion / ProductVersion = 1.8.0（数值字段 1,8,0,0，与字符串一致）
