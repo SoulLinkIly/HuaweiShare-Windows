@@ -1,3 +1,5 @@
+//! RSA 身份：密钥生成/加载、OAEP 加解密、公钥 DER 导出。
+
 use rand::rngs::OsRng;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::traits::PublicKeyParts;
@@ -20,6 +22,7 @@ pub fn to_pem(key: &RsaPrivateKey) -> CryptoResult<String> {
 pub fn from_pem(pem: &str) -> CryptoResult<RsaPrivateKey> {
     let key = RsaPrivateKey::from_pkcs8_pem(pem).map_err(|e| format!("PEM 解析失败: {e}"))?;
     if key.size() != 256 {
+
         return Err("身份密钥必须是 RSA-2048".into());
     }
     Ok(key)

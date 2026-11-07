@@ -1,62 +1,56 @@
-use std::ffi::OsStr;
+//! 接收确认框：30 秒超时，返回是否接收与等待期间从对端读到的数据。
+
+use crate::ui::font::{WEIGHT_BOLD, WEIGHT_NORMAL};
 use std::io::Read;
 use std::net::TcpStream;
-use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ui::draw as ui_draw;
+use crate::ui::popup;
+use crate::ui::theme::{
+    ACCENT as COL_ACCENT, BG as COL_BG, HOVER as COL_HOVER, LINE as COL_LINE, MAIN as COL_MAIN,
+    RADIUS, SUB as COL_SUB,
+};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, SelectObject, SetBkMode,
-    SetTextColor, UpdateWindow,
-    CLIP_DEFAULT_PRECIS, DEFAULT_PITCH, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
-    ANTIALIASED_QUALITY, FF_DONTCARE, FW_BOLD, FW_NORMAL, GB2312_CHARSET, OUT_DEFAULT_PRECIS,
-    TRANSPARENT,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, SelectObject, SetBkMode,
+    SetTextColor, UpdateWindow, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    FlashWindow, GetClientRect, GetMessageW, GetSystemMetrics, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    TranslateMessage, HWND_TOPMOST, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_TOPMOST, WS_POPUP,
+    BringWindowToTop, DefWindowProcW, DestroyWindow, FlashWindow, GetClientRect, PostMessageW,
+    PostQuitMessage, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_LAYERED, WS_EX_TOPMOST,
 };
 
 const CAPTION: &str = "华为分享 · 接收确认";
+
 const TIMEOUT_SECS: u64 = 30;
 
 const WM_DESTROY: u32 = 0x0002;
 const WM_CLOSE: u32 = 0x0010;
 const WM_GETDLGCODE: u32 = 0x0087;
 const WM_KEYDOWN: u32 = 0x0100;
+
 const WM_APP_CLOSE: u32 = 0x8001;
 const DLGC_WANTALLKEYS: isize = 0x0004;
 const VK_RETURN: usize = 0x0D;
 const VK_ESCAPE: usize = 0x1B;
-const IDC_ARROW: usize = 32512;
-const SM_CXSCREEN: i32 = 0;
-const SM_CYSCREEN: i32 = 1;
 const SW_SHOW: i32 = 5;
 
 const WM_PAINT: u32 = 0x000F;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_ERASEBKGND: u32 = 0x0014;
+
 const CARD_W: i32 = 400;
 const CARD_H: i32 = 176;
 const BTN_H: i32 = 46;
-const RADIUS: i32 = 22;
-const COL_BG: u32 = 0x00FF_FFFF;
-const COL_MAIN: u32 = 0x001A_1A1A;
-const COL_SUB: u32 = 0x0093_8E8E;
-const COL_LINE: u32 = 0x00EA_E5E5;
-const COL_HOVER: u32 = 0x00F7_F2F2;
-const COL_ACCENT: u32 = 0x00FF_7A00;
 
 static CARD_DPI: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(96);
+
 static CANVAS: std::sync::OnceLock<Mutex<Option<crate::layered::Canvas>>> =
     std::sync::OnceLock::new();
 static WIN_POS: [std::sync::atomic::AtomicI32; 2] = [
@@ -69,6 +63,7 @@ static HOVER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
 const CLASS_NAME: &str = "HWShareConfirmWnd";
 
 static RESULT: AtomicI32 = AtomicI32::new(-1);
+
 static REASON: AtomicI32 = AtomicI32::new(0);
 
 fn reason_text(code: i32) -> &'static str {
@@ -83,26 +78,9 @@ fn reason_text(code: i32) -> &'static str {
     }
 }
 
-fn wide(text: &str) -> Vec<u16> {
-    OsStr::new(text).encode_wide().chain(std::iter::once(0)).collect()
-}
-
-#[allow(dead_code)]
-fn peer_gone(stream: &TcpStream) -> bool {
-    let _ = stream.set_nonblocking(true);
-    let mut probe = [0u8; 1];
-    let gone = match stream.peek(&mut probe) {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-        Err(_) => true,
-    };
-    let _ = stream.set_nonblocking(false);
-    gone
-}
-
 const DRAIN_MAX: usize = 64 * 1024;
 
+/// 对端连接的三种可见状态。`Reset` 一律关窗，`Eof` 是否关窗受 `HWSHARE_CONFIRM_EOF_CLOSE` 控制。
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Peer {
     Alive,
@@ -112,6 +90,7 @@ enum Peer {
 
 fn probe(stream: &TcpStream, sink: &mut Vec<u8>) -> Peer {
     let _ = stream.set_nonblocking(true);
+
     let mut reader = stream;
     let mut buf = [0u8; 8192];
     let mut state = Peer::Alive;
@@ -153,9 +132,7 @@ fn probe(stream: &TcpStream, sink: &mut Vec<u8>) -> Peer {
 }
 
 fn eof_closes() -> bool {
-    !std::env::var("HWSHARE_CONFIRM_EOF_CLOSE")
-        .map(|v| v.trim() == "0")
-        .unwrap_or(false)
+    crate::env::unless_zero("HWSHARE_CONFIRM_EOF_CLOSE")
 }
 
 pub struct Answer {
@@ -171,6 +148,7 @@ impl Answer {
 
 static LINE_SUB: Mutex<String> = Mutex::new(String::new());
 static LINE_MAIN: Mutex<String> = Mutex::new(String::new());
+
 static FONT_SUB: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static FONT_MAIN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static FONT_BTN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -190,21 +168,16 @@ unsafe fn button_at(hwnd: HWND, x: i32, y: i32) -> usize {
 }
 
 unsafe fn paint_card(hwnd: HWND) {
-    let Some(slot) = CANVAS.get() else { return };
-    let Ok(guard) = slot.lock() else { return };
-    let Some(canvas) = guard.as_ref() else { return };
-    let hdc = canvas.mem;
-    let (w, h) = (canvas.w, canvas.h);
+    let Some((hdc, w, h)) = crate::layered::canvas_info(CANVAS.get()) else { return };
     let rc = RECT { left: 0, top: 0, right: w, bottom: h };
+
     let dpi = CARD_DPI.load(Ordering::SeqCst).max(96);
     let px = |v: i32| v * dpi / 96;
 
     let btn_h = px(BTN_H);
     let btn_top = h - btn_h;
 
-    let bg = CreateSolidBrush(COL_BG);
-    FillRect(hdc, &rc, bg);
-    DeleteObject(bg as _);
+    ui_draw::fill(hdc, rc.left, rc.top, rc.right, rc.bottom, COL_BG);
     SetBkMode(hdc, TRANSPARENT as i32);
 
     let sub = LINE_SUB.lock().map(|s| s.clone()).unwrap_or_default();
@@ -242,10 +215,7 @@ unsafe fn paint_card(hwnd: HWND) {
     for (id, label) in [(1usize, "拒绝"), (2usize, "接收")] {
         let (bx, bw) = if id == 1 { (0, w / 2) } else { (w / 2 + 1, w / 2) };
         if hover == id {
-            let hb = CreateSolidBrush(COL_HOVER);
-            let hr = RECT { left: bx, top: btn_top + 1, right: bx + bw, bottom: h };
-            FillRect(hdc, &hr, hb);
-            DeleteObject(hb as _);
+            ui_draw::fill(hdc, bx, btn_top + 1, bx + bw, h, COL_HOVER);
         }
         let f_btn = FONT_BTN.load(Ordering::SeqCst);
         if f_btn != 0 {
@@ -258,11 +228,13 @@ unsafe fn paint_card(hwnd: HWND) {
     }
 
     let radius = RADIUS * CARD_DPI.load(Ordering::SeqCst).max(96) / 96;
-    canvas.commit(
+    crate::layered::commit_canvas(
+        &CANVAS,
         hwnd,
         WIN_POS[0].load(Ordering::SeqCst),
         WIN_POS[1].load(Ordering::SeqCst),
         radius,
+        255,
     );
 }
 
@@ -272,6 +244,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             paint_card(hwnd);
             0
         }
+
         WM_MOUSEMOVE => {
             let x = (lparam & 0xFFFF) as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i32;
@@ -300,12 +273,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         WM_ERASEBKGND => 1,
+
         WM_CLOSE => {
             RESULT.store(0, Ordering::SeqCst);
             REASON.store(6, Ordering::SeqCst);
             DestroyWindow(hwnd);
             0
         }
+
         WM_APP_CLOSE => {
             RESULT.store(0, Ordering::SeqCst);
             DestroyWindow(hwnd);
@@ -323,6 +298,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             0
         }
+
         WM_GETDLGCODE => DLGC_WANTALLKEYS,
         WM_DESTROY => {
             PostQuitMessage(0);
@@ -334,13 +310,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 static ASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answer {
+pub fn ask(
+    peer: &str,
+    count: u32,
+    folders: u32,
+    bytes: u64,
+    watch: Option<TcpStream>,
+) -> Answer {
+
     #[cfg(windows)]
     crate::tray::enable_dpi_awareness();
-    if std::env::var("HWSHARE_CONFIRM")
-        .map(|v| v.trim() == "0")
-        .unwrap_or(false)
-    {
+    if !crate::env::unless_zero("HWSHARE_CONFIRM") {
         crate::trace::confirm_show(peer, count, bytes);
         crate::trace::confirm_answer(peer, true, "HWSHARE_CONFIRM=0 自动接收");
         return Answer::plain(true);
@@ -351,80 +331,49 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-    let class = wide(CLASS_NAME);
-    let caption = wide(CAPTION);
+    popup::register_class(CLASS_NAME, Some(wndproc), 0);
+    RESULT.store(-1, Ordering::SeqCst);
+    let Some(win) = popup::create_layered(
+        CLASS_NAME,
+        CAPTION,
+        (CARD_W, CARD_H),
+        WS_EX_TOPMOST | WS_EX_LAYERED,
+        popup::Placement::Centered,
+    ) else {
+        crate::trace::confirm_answer(peer, true, "窗口创建失败，按接收处理");
+        return Answer::plain(true);
+    };
+    let dpi = win.dpi;
+    let hwnd = win.hwnd;
+    CARD_DPI.store(dpi, Ordering::SeqCst);
+    WIN_POS[0].store(win.x, Ordering::SeqCst);
+    WIN_POS[1].store(win.y, Ordering::SeqCst);
+    crate::layered::install_canvas(&CANVAS, unsafe {
+        crate::layered::Canvas::new(win.w, win.h)
+    });
 
     unsafe {
-        let mut wc: WNDCLASSW = std::mem::zeroed();
-        wc.style = 0x0001 | 0x0002;
-        wc.lpfnWndProc = Some(wndproc);
-        wc.hInstance = instance;
-        wc.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW as *const u16) as _;
-        wc.hbrBackground = std::ptr::null_mut();
-        wc.lpszClassName = class.as_ptr();
-        RegisterClassW(&wc);
 
-        let dpi = {
-            let d = GetDpiForSystem();
-            if d == 0 { 96 } else { d as i32 }
-        };
-        CARD_DPI.store(dpi, Ordering::SeqCst);
-        let cw = CARD_W * dpi / 96;
-        let ch = CARD_H * dpi / 96;
-
-        let style = WS_POPUP;
-        let exstyle = WS_EX_TOPMOST | WS_EX_LAYERED;
-        let x = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
-        let y = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
-
-        RESULT.store(-1, Ordering::SeqCst);
-        let hwnd = CreateWindowExW(
-            exstyle,
-            class.as_ptr(),
-            caption.as_ptr(),
-            style,
-            x,
-            y,
-            cw,
-            ch,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            instance,
-            std::ptr::null(),
-        );
-        if hwnd.is_null() {
-            crate::trace::confirm_answer(peer, true, "窗口创建失败，按接收处理");
-            return Answer::plain(true);
-        }
-
-        WIN_POS[0].store(x, Ordering::SeqCst);
-        WIN_POS[1].store(y, Ordering::SeqCst);
-        if let Some(canvas) = crate::layered::Canvas::new(cw, ch) {
-            *CANVAS.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(canvas);
-        }
-
-        let face = wide("Microsoft YaHei UI");
         let mk = |h: i32, weight: i32| {
-            CreateFontW(
-                -h * dpi / 96, 0, 0, 0, weight, 0, 0, 0,
-                GB2312_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32,
-                ANTIALIASED_QUALITY as u32, (DEFAULT_PITCH | FF_DONTCARE) as u32, face.as_ptr(),
-            )
+            crate::ui::font::ui(h * dpi / 96, weight)
         };
-        let f_sub = mk(14, FW_NORMAL as i32);
-        let f_main = mk(16, FW_NORMAL as i32);
-        let f_btn = mk(16, FW_BOLD as i32);
+        let f_sub = mk(14, WEIGHT_NORMAL);
+        let f_main = mk(16, WEIGHT_NORMAL);
+        let f_btn = mk(16, WEIGHT_BOLD);
         FONT_SUB.store(f_sub as isize, Ordering::SeqCst);
         FONT_MAIN.store(f_main as isize, Ordering::SeqCst);
         FONT_BTN.store(f_btn as isize, Ordering::SeqCst);
 
         let mb = bytes as f64 / 1048576.0;
-        let size_line = if mb < 1.0 {
-            format!("{count} 个文件，共 {:.0} KB", bytes as f64 / 1024.0)
+        let amount = if mb < 1.0 {
+            format!("{:.0} KB", bytes as f64 / 1024.0)
         } else {
-            format!("{count} 个文件，共 {mb:.1} MB")
+            format!("{mb:.1} MB")
+        };
+        let size_line = if folders > 0 {
+            format!("{folders} 个文件夹 · {count} 个文件，共 {amount}")
+        } else {
+            format!("{count} 个文件，共 {amount}")
         };
         if let Ok(mut slot) = LINE_SUB.lock() {
             *slot = format!("来自 {peer}");
@@ -436,6 +385,7 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
         paint_card(hwnd);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -469,6 +419,7 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
                         None => Peer::Alive,
                     }
                 };
+
                 let close = match peer {
                     Peer::Reset => true,
                     Peer::Eof => close_on_eof,
@@ -482,19 +433,17 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
             }
         });
 
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        popup::run_message_loop();
 
         let _ = guard.join();
+
         for f in [f_sub, f_main, f_btn] {
             if !f.is_null() {
                 DeleteObject(f as _);
             }
         }
         let yes = RESULT.load(Ordering::SeqCst) == 1;
+
         let drained: Vec<u8> = {
             let mut slot = drained.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *slot)
@@ -510,6 +459,7 @@ pub fn ask(peer: &str, count: u32, bytes: u64, watch: Option<TcpStream>) -> Answ
             }
         );
         if !drained.is_empty() {
+
             crate::trace::note(
                 "control",
                 &format!(
@@ -529,6 +479,7 @@ mod tests {
 
     #[test]
     fn timeout_is_30s() {
+
         assert_eq!(super::TIMEOUT_SECS, 30);
     }
 

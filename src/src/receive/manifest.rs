@@ -1,8 +1,10 @@
+//! 合并对端发来的清单（重传时会分片到达），并回 ack。
+
 use crate::channel::Channel;
 use crate::transfer::{self};
 use crate::Result;
 
-pub(super) const MAX_MANIFEST: usize = 4096;
+pub(super) const MAX_MANIFEST: usize = crate::transfer::MAX_MANIFEST_ENTRIES;
 
 pub(super) fn merge_manifest(
     expected: &mut Vec<(u16, u64, String)>,
@@ -12,6 +14,7 @@ pub(super) fn merge_manifest(
     if data.len() < 2 {
         return 0;
     }
+
     let mut seen: std::collections::HashSet<u16> = expected
         .iter()
         .map(|(id, _, _)| *id)
@@ -33,11 +36,13 @@ pub(super) fn merge_manifest(
         }
         let name = String::from_utf8_lossy(&data[offset..offset + nlen]).to_string();
         offset += nlen;
+
         if !seen.insert(id) {
             crate::trace::note("file#1", &format!("清单里 id={id} 重复，忽略后一条"));
             continue;
         }
         if fsize == 0 {
+
             crate::trace::note(
                 "file#1",
                 &format!("清单里 {name} 是 0 字节，按空文件接受（ACK 后收尾时创建）"),
@@ -49,6 +54,7 @@ pub(super) fn merge_manifest(
             crate::trace::note("file#1", &format!("清单里 id={id} 没有文件名，忽略"));
             continue;
         }
+
         if expected.len() + empty.len() >= MAX_MANIFEST {
             crate::trace::note(
                 "file#1",
@@ -73,6 +79,7 @@ pub(super) fn ack_manifest(
     for (id, _, _) in expected {
         ids.extend_from_slice(&id.to_be_bytes());
     }
+
     for (id, _) in empty {
         ids.extend_from_slice(&id.to_be_bytes());
     }

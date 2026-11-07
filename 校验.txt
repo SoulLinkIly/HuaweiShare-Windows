@@ -1,0 +1,23 @@
+华为分享 1.8.0 · 成品校验
+
+版本：1.8.0（第一个对外发布版本）
+构建：2026-11-07，`src\build.ps1`（Rust stable x86_64-pc-windows-gnu，release，panic=abort，strip）
+验证：cargo test = 202 单元 + 6 回环，release 零警告
+版本资源：FileVersion / ProductVersion = 1.8.0（数值字段 1,8,0,0，与字符串一致）
+
+文件                    字节数      SHA-256
+hwshare.exe             1221632   d70c6a30857cb07d2644b33c49d33416c106d832d4083b0541558f0bc775325b
+hwshare-cli.exe         1190912   5b4c4e58ee7fa5afad4c4200171cc122e0140a794a2f84ea0829d155f34ba2b3
+
+注意：手敲 cargo build 不会跑 build.rs 里的 windres 步骤，产物没有图标/版本资源，
+      大小与上面不同属正常。发版请用 build.ps1。
+
+核对方法（PowerShell）：
+    Get-FileHash .\bin\hwshare.exe -Algorithm SHA256
+    (Get-Item .\bin\hwshare.exe).VersionInfo.FileVersion
+
+目录：
+  bin\      成品（hwshare.exe 托盘程序、hwshare-cli.exe 命令行）
+  src\      全部源码 + Cargo.toml/lock + build.ps1 + build.rs + assets\ + tests\
+  docs\     协议与实现文档（协议与排错、04-实现要点、索引）
+  README.md / 版本说明.md / 使用说明.md / LICENSE / NOTICE.md / 构建.bat

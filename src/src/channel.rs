@@ -1,3 +1,5 @@
+//! TCP 帧通道：带缓冲的读写、超时，以及 Windows 上的 keepalive 与 socket 缓冲调优。
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -5,11 +7,20 @@ use std::time::{Duration, Instant};
 use crate::{frame_decode, Error, Result, FRAME_HEADER_SIZE};
 
 fn debug_io() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HWSHARE_DEBUG").is_some())
+    crate::env::present("HWSHARE_DEBUG")
 }
 
 fn friendly_io(e: &std::io::Error) -> String {
+    match e.kind() {
+        ErrorKind::TimedOut => return "对方不在线（连接超时）".to_string(),
+        ErrorKind::ConnectionRefused => return "对方拒绝连接（端口没开）".to_string(),
+        ErrorKind::ConnectionReset => return "对方中断了分享（连接被重置）".to_string(),
+        ErrorKind::ConnectionAborted => return "连接被中止（网络切换？）".to_string(),
+        ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
+            return "网络不通，检查是否同一局域网".to_string()
+        }
+        _ => {}
+    }
     match e.raw_os_error() {
         Some(10054) => "对方中断了分享（连接被重置）".to_string(),
         Some(10060) | Some(10061) => "对方不在线或拒绝连接（超时）".to_string(),
@@ -22,10 +33,15 @@ fn friendly_io(e: &std::io::Error) -> String {
 pub struct Channel {
     stream: TcpStream,
     peer: String,
+
     pending: Vec<u8>,
+
     label: String,
+
     role: &'static str,
+
     conn: u64,
+
     traced_open: bool,
     traced_t0: Instant,
     tx_bytes: u64,
@@ -74,6 +90,7 @@ fn tune_keepalive(stream: &TcpStream) {
             &on as *const i32 as *const u8,
             4,
         );
+
         let ka = tcp_keepalive {
             onoff: 1,
             keepalivetime: 30_000,
@@ -111,9 +128,10 @@ impl Channel {
             .parse()
             .map_err(|_| Error::Argument)?;
         let stream = TcpStream::connect_timeout(&sock, timeout).map_err(|e| {
-            let msg = format!("连接 {ip}:{port} 失败: {e}");
+            let msg = format!("连不上 {ip}:{port}：{}", friendly_io(&e));
+
             crate::trace::channel_fail(ip, port, &msg);
-            Error::Io(msg)
+            Error::Network(msg)
         })?;
         tune_socket(&stream);
         Ok(Self {
@@ -133,6 +151,7 @@ impl Channel {
 
     pub fn from_stream(stream: TcpStream, peer: impl Into<String>) -> Result<Self> {
         tune_socket(&stream);
+
         let _ = stream.set_nonblocking(false);
         Ok(Self {
             stream,
@@ -210,6 +229,7 @@ impl Channel {
 
     pub fn transmit(&mut self, data: &[u8]) -> Result<()> {
         self.ensure_trace_open();
+
         match self.stream.write_all(data) {
             Ok(()) => {
                 self.tx_bytes += data.len() as u64;
@@ -220,17 +240,18 @@ impl Channel {
             Err(e) => {
                 self.close_reason = "write-error";
                 let timeout = matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
+
                 crate::trace::note(
                     &self.label,
                     &format!("写失败：本帧 {} 字节未完整写出（{e}）", data.len()),
                 );
-                Err(Error::Io(if timeout {
+                Err(Error::Network(if timeout {
                     format!(
-                        "发送超时（{} s 内没写完，对端可能已离线）",
+                        "发送超时（{} 秒内没写完，对方可能已经离线）",
                         WRITE_TIMEOUT.as_secs()
                     )
                 } else {
-                    format!("发送失败: {}", friendly_io(&e))
+                    format!("发送失败：{}", friendly_io(&e))
                 }))
             }
         }
@@ -240,6 +261,7 @@ impl Channel {
         let deadline = Instant::now() + timeout;
         let mut buf = vec![0u8; size];
         let mut filled = 0usize;
+
         if !self.pending.is_empty() {
             let take = size.min(self.pending.len());
             buf[..take].copy_from_slice(&self.pending[..take]);
@@ -295,7 +317,7 @@ impl Channel {
             Err(e) if transient(&e) => Ok(Vec::new()),
             Err(e) => {
                 self.close_reason = "read-error";
-                Err(Error::Io(format!("接收失败: {}", friendly_io(&e))))
+                Err(Error::Network(format!("接收失败：{}", friendly_io(&e))))
             }
         }
     }
@@ -331,7 +353,7 @@ impl Channel {
             Err(e) => {
                 self.pending.truncate(old);
                 self.close_reason = "read-error";
-                Err(Error::Io(format!("接收失败: {}", friendly_io(&e))))
+                Err(Error::Network(format!("接收失败：{}", friendly_io(&e))))
             }
         }
     }
@@ -344,6 +366,7 @@ impl Channel {
     }
 
     pub fn fill(&mut self, want: usize, timeout: Duration) -> Result<bool> {
+
         let n = self.fill_pending(want.max(16384).min(65536), timeout)?;
         Ok(n > 0)
     }
@@ -390,7 +413,7 @@ impl Channel {
         }
 
         if data.len() != expected {
-            if std::env::var("HWSHARE_DEBUG").is_ok() {
+            if debug_io() {
                 eprintln!(
                     "[rust-io] read_frame 不完整: 收到 {} 期望 {} 头={:02X?}",
                     data.len(), expected,
@@ -408,6 +431,7 @@ impl Channel {
         let deadline = Instant::now() + timeout;
 
         loop {
+
             if self.pending.len() >= FRAME_HEADER_SIZE {
                 let (_, _, _, _, len) = frame_decode(&self.pending[..FRAME_HEADER_SIZE])
                     .map_err(|e| {
@@ -504,9 +528,11 @@ impl Drop for Channel {
         if !crate::trace::enabled() {
             return;
         }
+
         if !self.traced_open {
             self.ensure_trace_open();
         }
+
         if !self.pending.is_empty() {
             crate::trace::frame_partial(&self.label, "rx", &self.pending, self.conn);
         }
@@ -537,6 +563,7 @@ impl Listener {
         inner
             .set_nonblocking(false)
             .map_err(|e| Error::Io(e.to_string()))?;
+
         crate::trace::listen("tcp", &bound.to_string());
         Ok(Self { inner, ip: ip.to_string(), port: bound.port() })
     }
@@ -559,6 +586,7 @@ impl Listener {
     }
 
     pub fn accept(&self, timeout: Duration) -> Result<Channel> {
+
         struct Restore<'a>(&'a TcpListener);
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
@@ -587,8 +615,9 @@ impl Listener {
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
-                        return Err(Error::Io("等待对端连接超时".into()));
+                        return Err(Error::Network("等不到对方建立数据通道".into()));
                     }
+
                     spins += 1;
                     std::thread::sleep(if spins <= 20 {
                         Duration::from_millis(1)
@@ -597,7 +626,7 @@ impl Listener {
                     });
                 }
                 Err(e) => {
-                    return Err(Error::Io(format!("accept 失败: {}", friendly_io(&e))));
+                    return Err(Error::Network(format!("接不上对方：{}", friendly_io(&e))));
                 }
             }
         }
@@ -668,6 +697,7 @@ mod tests {
     fn failed_send_does_not_count_bytes() {
         let listener = Listener::bind("127.0.0.1", 0).unwrap();
         let port = listener.port;
+
         let mut chan = Channel::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
         let _peer = listener.accept(Duration::from_secs(5)).unwrap();
 

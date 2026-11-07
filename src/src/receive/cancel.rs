@@ -1,3 +1,5 @@
+//! 接收侧取消：解析控制通道上的取消指令，维护取消标志与排空帧记录。
+
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -6,13 +8,16 @@ use crate::channel::Channel;
 use crate::transfer::{self};
 use crate::FRAME_HEADER_SIZE;
 
+fn is_cancel_command(cmd: &[u8]) -> bool {
+    matches!(cmd, b"senderCancel" | b"receiverCancel" | b"user_reject")
+}
+
 pub(super) fn take_pending_cancel(control: &mut Channel, key: &[u8; 32]) -> Option<String> {
     let deadline = Instant::now() + Duration::from_millis(250);
     while Instant::now() < deadline {
         match control.try_read_frame(Duration::from_millis(10)) {
             Ok(Some(wire_frame)) => {
-                let Some(head) = wire_frame.get(4..8) else { continue };
-                if u32::from_le_bytes(head.try_into().unwrap()) != 9 {
+                if crate::u32_at(&wire_frame, 4) != Some(9) {
                     continue;
                 }
                 let Ok(body) = transfer::open_channel_frame(&wire_frame, key) else {
@@ -29,10 +34,7 @@ pub(super) fn take_pending_cancel(control: &mut Channel, key: &[u8; 32]) -> Opti
                         continue;
                     };
                     for (_, cmd) in cmds {
-                        if matches!(
-                            cmd.as_slice(),
-                            b"senderCancel" | b"receiverCancel" | b"user_reject"
-                        ) {
+                        if is_cancel_command(cmd.as_slice()) {
                             return Some(String::from_utf8_lossy(&cmd).to_string());
                         }
                     }
@@ -170,11 +172,12 @@ pub(super) fn printable(value: &[u8]) -> String {
 }
 
 pub(super) fn hex_head(value: &[u8]) -> String {
+    use std::fmt::Write;
     const N: usize = 64;
     let n = value.len().min(N);
     let mut out = String::with_capacity(n * 3 + 4);
     for byte in &value[..n] {
-        out.push_str(&format!("{byte:02X} "));
+        let _ = write!(out, "{byte:02X} ");
     }
     if value.len() > N {
         out.push('…');

@@ -1,3 +1,6 @@
+//! 局域网发现：UDP 5684 上的 CoAP 风格 beacon / query / ACK。
+//! 能否接收分享看 `capabilityBitmap` 的掩码值 256，解析结果只有接收 / 不接收两态。
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -8,6 +11,7 @@ use serde_json::Value;
 use crate::{Error, Result};
 
 pub const PORT: u16 = 5684;
+
 pub const MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 1);
 
 static SCAN_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -30,6 +34,8 @@ pub struct Peer {
     pub brand: String,
     pub kind: String,
     pub last_seen: Instant,
+    /// 对端 `capabilityBitmap` 里有没有 256 位 —— 有才代表「它现在会接收分享」。
+    pub accepts: bool,
 }
 
 pub fn is_discovery_packet(data: &[u8]) -> bool {
@@ -37,6 +43,7 @@ pub fn is_discovery_packet(data: &[u8]) -> bool {
 }
 
 pub fn discovery_beacon(local_ip: &str, port: u16, identity: &str, name: &str, discovering: bool) -> Vec<u8> {
+
     let seq_no = (rand::random::<u16>()) as u32;
     let device_id = format!(r#"{{"UDID":"{identity}"}}"#);
     let mode = if discovering { 1 } else { 10 };
@@ -49,7 +56,7 @@ pub fn discovery_beacon(local_ip: &str, port: u16, identity: &str, name: &str, d
                 r#""wlanIp":"{}","capabilityBitmap":[{}],"bType":5,"seqNo":{}"#
             ),
             json_string(&device_id),
-            json_string(&truncate(name, 60)),
+            json_string(crate::clip_chars(name, 60)),
             DEVICE_TYPE_PC,
             mode,
             port,
@@ -66,7 +73,7 @@ pub fn discovery_beacon(local_ip: &str, port: u16, identity: &str, name: &str, d
                 r#""wlanIp":"{}","capabilityBitmap":[{}],"bType":5,"seqNo":{}"#
             ),
             json_string(&device_id),
-            json_string(&truncate(name, 60)),
+            json_string(crate::clip_chars(name, 60)),
             DEVICE_TYPE_PC,
             mode,
             port,
@@ -82,7 +89,7 @@ pub fn discovery_beacon(local_ip: &str, port: u16, identity: &str, name: &str, d
         out.extend_from_slice(&[0x50, 0x02]);
         out.extend_from_slice(&(rand::random::<u16>()).to_be_bytes());
         push_option(&mut out, 3, local_ip.as_bytes());
-        push_option(&mut out, 8, b"device_discover");      
+        push_option(&mut out, 8, b"device_discover");
         out.push(0xFF);
     } else {
         let mut token = [0u8; 4];
@@ -123,7 +130,7 @@ pub fn advertisement_query_harmony(local_ip: &str, port: u16, identity: &str, na
             r#""coapUri":"coap://{}/device_discover""#
         ),
         json_string(&device_id),
-        json_string(&truncate(name, 60)),
+        json_string(crate::clip_chars(name, 60)),
         DEVICE_TYPE_PC,
         port,
         local_ip,
@@ -153,10 +160,6 @@ fn summary_hex(identity: &str) -> String {
 const CAPABILITY_BITS: u64 = 455;
 
 const DEVICE_TYPE_PC: u32 = 12;
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    s.chars().take(max_chars).collect()
-}
 
 fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -218,6 +221,12 @@ fn parse_options(data: &[u8]) -> Result<(usize, HashMap<u64, Vec<u8>>)> {
     Ok((offset, options))
 }
 
+/// 对端用 CON（首字节 0x4x）发来的应答必须回 4 字节 ACK，否则会按 0 s / 1.2 s / 3.5 s
+/// 重传三次。实测补上这个 ACK 后，一次 query 只收到一个应答。
+pub fn discovery_ack(message_id: [u8; 2]) -> [u8; 4] {
+    [0x60, 0x00, message_id[0], message_id[1]]
+}
+
 pub fn parse_discovery_beacon(data: &[u8], host: &str, local_network: Ipv4Addr, local_prefix: u8) -> Result<(Peer, bool, [u8; 2])> {
     let src: Ipv4Addr = host.parse().map_err(|_| Error::Format)?;
     if src == local_network || !same_subnet(src, local_network, local_prefix) {
@@ -273,9 +282,10 @@ pub fn parse_discovery_beacon(data: &[u8], host: &str, local_network: Ipv4Addr, 
         Some(17) => "tablet",
         _ => "unknown",
     };
-    if first_cap & SHARE_CAPABILITY_BIT == 0 && !matches!(kind, "phone" | "tablet") {
-        return Err(Error::Protocol("对端未声明分享能力".into()));
-    }
+
+    // 没有 256 位不代表这是非法包：手机在「关闭」或「仅分享过但没加你」时照样回设备信息，
+    // 只是明说「我不接收」。这种设备要留在列表里，标记成不可发送，而不是当垃圾包丢掉。
+    let accepts = first_cap & SHARE_CAPABILITY_BIT != 0;
 
     let service = obj.get("serviceData").and_then(|v| v.as_str()).unwrap_or("");
     let port = service
@@ -300,6 +310,7 @@ pub fn parse_discovery_beacon(data: &[u8], host: &str, local_network: Ipv4Addr, 
         brand: "Huawei".to_string(),
         kind: kind.to_string(),
         last_seen: Instant::now(),
+        accepts,
     };
 
     let confirmable = message_type == 0;
@@ -367,17 +378,21 @@ mod tests {
 
     #[test]
     fn keepalive_packet_is_not_discovery() {
+
         assert!(!is_discovery_packet(&[0x60, 0x00, 0xF5, 0x8E]));
         assert!(!is_discovery_packet(&[]));
+
         let pkt = discovery_beacon("192.168.1.5", 41234, "AABB", "PC", true);
         assert!(is_discovery_packet(&pkt));
         let answer = discovery_beacon("192.168.1.5", 41234, "AABB", "PC", false);
         assert!(is_discovery_packet(&answer));
+
         assert!(!is_discovery_packet(&vec![0u8; 100]));
     }
 
     #[test]
     fn advertisement_shape() {
+
         let query = discovery_beacon("192.168.1.5", 41234, "AABBCCDDEEFF", "我的电脑", true);
         assert_eq!(&query[0..2], &[0x50, 0x02]);
         assert!(query.windows(15).any(|w| w == b"device_discover"));
@@ -386,6 +401,7 @@ mod tests {
         assert!(text.contains(r#""wlanIp":"192.168.1.5""#));
         assert!(text.contains(r#""mode":1"#));
         assert!(text.contains("summary:"));
+
         assert!(text.contains(r#""type":12"#));
 
         let answer = discovery_beacon("192.168.1.5", 41234, "AABBCCDDEEFF", "我的电脑", false);
@@ -398,6 +414,15 @@ mod tests {
     #[test]
     fn json_escaping() {
         assert_eq!(json_string(r#"a"b"#), r#""a\"b""#);
+    }
+
+    #[test]
+    fn ack_frame_shape() {
+        // 与手机回我们的 ACK（`60 00 d8 3c`）同形：type=ACK(2)、零长度、回显 message id
+        let ack = discovery_ack([0xD8, 0x3C]);
+        assert_eq!(ack, [0x60, 0x00, 0xD8, 0x3C]);
+        assert_eq!((ack[0] >> 4) & 3, 2);
+        assert_eq!(ack[1], 0x00);
     }
 
     #[test]

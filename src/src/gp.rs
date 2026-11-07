@@ -1,5 +1,8 @@
+//! 动态加载 gdiplus，画抗锯齿圆弧（加载失败时调用方退回折线）。
+
 #![cfg(windows)]
 
+use crate::ui::text::wide;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -43,10 +46,6 @@ struct Api {
 const SMOOTHING_ANTIALIAS: i32 = 4;
 const LINE_CAP_ROUND: i32 = 2;
 const UNIT_PIXEL: i32 = 2;
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
 
 fn ansi(s: &str) -> Vec<u8> {
     s.bytes().chain(std::iter::once(0)).collect()

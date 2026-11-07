@@ -1,23 +1,27 @@
-/华为分享.exe
-/products/
-
-target/
+# 构建产物
 src/target/
-.build*/
+target/
+products/target/
+/华为分享.exe
 
+# 日志与临时文件
 *.log
 *.part
-_recv_test/
-capture-*.jsonl
-
-*.bmp
 *.tmp
+.build*/*.log
 
+# 采集 / 实验残留（HWSHARE_TRACE=1 时产生）
+capture-*.jsonl
+_recv_test/
+*.bmp
+
+# 证书与私钥：一律不入库
 *.pfx
 *.p12
 *.cer
 *.pvk
 
+# 系统杂物
 Thumbs.db
 desktop.ini
 .DS_Store

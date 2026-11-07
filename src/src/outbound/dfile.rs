@@ -1,3 +1,5 @@
+//! 发送侧数据帧：分块、加密、进度上报与限速。
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -6,33 +8,21 @@ use crate::transfer;
 use crate::{Error, Result};
 use super::*;
 
-pub(super) const DFRAME_DEFAULT: usize = 1472;
-
-pub(super) const DFRAME_OVERHEAD: usize = 50;
-
 pub(super) const BATCH_BYTES: usize = 256 * 1024;
 
-pub(super) fn batch_bytes() -> usize {
-    std::env::var("HWSHARE_BATCH_BYTES")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(BATCH_BYTES)
-}
-
 pub fn chunk_size() -> usize {
-    let from_env = std::env::var("HWSHARE_CHUNK")
-        .ok()
+    let from_env = crate::env::text("HWSHARE_CHUNK")
         .and_then(|v| v.trim().parse::<usize>().ok());
     let chosen = from_env.or_else(crate::config::chunk);
     match chosen {
         Some(n) => n.clamp(512, crate::transfer::DFILE_MAX_CONTENT),
-        None => DFRAME_DEFAULT - DFRAME_OVERHEAD,
+        None => crate::transfer::DFILE_MAX_CONTENT,
     }
 }
 
 pub(super) fn data_frame_size(chunk: usize) -> u16 {
-    (chunk + DFRAME_OVERHEAD).min(u16::MAX as usize) as u16
+
+    (chunk + crate::transfer::DFRAME_OVERHEAD).min(u16::MAX as usize) as u16
 }
 
 pub(super) fn settings_profile(kind: transfer::PeerKind, frame_size: u16) -> transfer::SettingsProfile {
@@ -44,6 +34,7 @@ pub(super) fn settings_profile(kind: transfer::PeerKind, frame_size: u16) -> tra
 }
 
 pub(super) fn parse_ids(inner: &[u8]) -> Result<Vec<u16>> {
+
     let data = inner.get(8..).ok_or(Error::Truncated)?;
     if data.len() % 2 != 0 {
         return Err(Error::Format);
@@ -54,71 +45,43 @@ pub(super) fn parse_ids(inner: &[u8]) -> Result<Vec<u16>> {
         .collect())
 }
 
-pub(super) fn draw_progress(written: u64, total: u64, t0: Instant) {
-    use std::io::Write;
-    let pct = if total == 0 { 0.0 } else { written as f64 * 100.0 / total as f64 };
-    let width = 24usize;
-    let filled = ((pct / 100.0) * width as f64).round() as usize;
-    let bar = format!("{}{}", "#".repeat(filled.min(width)), "-".repeat(width - filled.min(width)));
-    let mb = written as f64 / 1048576.0;
-    let speed = mb / t0.elapsed().as_secs_f64().max(0.001);
-    let peer = PEER_PCT_BITS.load(Ordering::Relaxed);
-    if peer == u64::MAX {
-        print!(
-            "\r[{}] {:5.1}%  {:>7.1}/{:.1} MB  {:>5.1} MB/s",
-            bar, pct, mb, total as f64 / 1048576.0, speed
-        );
-    } else {
-        print!(
-            "\r[{}] {:5.1}%  {:>7.1}/{:.1} MB  {:>5.1} MB/s  对方 {:5.1}%",
-            bar,
-            pct,
-            mb,
-            total as f64 / 1048576.0,
-            speed,
-            f64::from_bits(peer)
-        );
-    }
-    let _ = std::io::stdout().flush();
+/// 进度上报。画不画、画到哪，由进程入口装的 sink 决定（见 `crate::report`）。
+pub(super) fn draw_progress(written: u64, total: u64, t0: Instant, peer_pct: u64) {
+    let speed = written as f64 / 1_048_576.0 / t0.elapsed().as_secs_f64().max(0.001);
+    crate::report::progress(&crate::report::Progress {
+        written,
+        total,
+        speed_mb: speed,
+        peer_pct: if peer_pct == u64::MAX {
+            None
+        } else {
+            Some(f64::from_bits(peer_pct))
+        },
+    });
 }
 
 pub(super) mod ov {
-    #[cfg(windows)]
-    pub use crate::overlay::{fail, finish, hide, set_multi, set_outgoing, start, update, waiting};
-    #[cfg(not(windows))]
-    pub fn set_outgoing(_ours: bool) {}
-    #[cfg(not(windows))]
-    pub fn start(_name: &str) {}
-    #[cfg(not(windows))]
-    pub fn waiting(_name: &str) {}
-    #[cfg(not(windows))]
-    pub fn set_multi(_count: usize) {}
-    #[cfg(not(windows))]
-    pub fn update(_sent: u64, _total: u64) {}
-    #[cfg(not(windows))]
-    pub fn finish() {}
-    #[cfg(not(windows))]
-    pub fn fail() {}
-    #[cfg(not(windows))]
-    pub fn hide() {}
+    pub use crate::overlay::{
+        abort, finish, preparing, set_batch, set_outgoing, start, update, waiting,
+    };
+}
+
+fn build_done_ack(key: &[u8], trans: u16) -> Result<Vec<u8>> {
+    transfer::dfile_seal_control(key, &transfer::assemble_dfile_packet(7, 0, 0, trans, b"")?)
 }
 
 fn finish_batch(
     chan: &mut Channel,
     key: &[u8],
     trans: u16,
-    apple: bool,
     written: u64,
     oguard: &mut SendOverlayGuard,
 ) -> Result<u64> {
-    let ack = transfer::dfile_seal_control(key, &transfer::assemble_dfile_packet(7, 0, 0, trans, b"")?)?;
-    let times = match std::env::var("HWSHARE_DONE_ACK").ok().as_deref() {
-        Some("0") | Some("none") => 0,
-        Some(v) => v.parse::<u32>().unwrap_or(3),
-        None => 3,
-    };
-    let _ = apple;
-    for i in 0..times {
+
+    let ack = build_done_ack(key, trans)?;
+
+    for i in 0..3 {
+
         match chan.transmit(&ack) {
             Ok(()) => {}
             Err(e) if i > 0 => {
@@ -127,11 +90,11 @@ fn finish_batch(
             }
             Err(e) => return Err(e),
         }
-        if i + 1 < times {
+        if i + 1 < 3 {
             std::thread::sleep(Duration::from_millis(15));
         }
     }
-    println!();
+    crate::report::end_line();
     ov::finish();
     oguard.done = true;
     Ok(written)
@@ -146,8 +109,7 @@ impl Drop for SendOverlayGuard {
         if self.done {
             return;
         }
-        ov::fail();
-        ov::hide();
+        ov::abort();
     }
 }
 
@@ -157,13 +119,16 @@ pub(super) fn send_file_chunks(
     file: &Outgoing,
     written: &mut u64,
     done: &mut Vec<u16>,
+
     done_trans: &mut Option<u16>,
+
     trans: u16,
     t0: Instant,
     total: u64,
     log: &dyn Fn(&str),
     cancel: &AtomicBool,
     progress: &AtomicU64,
+    fb: &PeerState,
 ) -> Result<()> {
     let mut handle = std::fs::File::open(&file.path)
         .map_err(|e| Error::Io(format!("打开 {} 失败: {e}", file.path.display())))?;
@@ -171,8 +136,9 @@ pub(super) fn send_file_chunks(
     let mut buf = vec![0u8; chunk];
     let mut sequence: u32 = 0;
     let mut offset: u64 = 0;
-    let batch_limit = batch_bytes();
-    let mut batch: Vec<u8> = Vec::with_capacity(batch_limit + chunk + 64);
+
+    let mut batch: Vec<u8> = Vec::with_capacity(BATCH_BYTES + chunk + 64);
+
     let mut sent = 0u64;
     let mut batch_content = 0u64;
     let mut last_report = Instant::now();
@@ -185,8 +151,8 @@ pub(super) fn send_file_chunks(
                 "file#1",
                 &format!("取消时已发 {} 字节（file={}）", sent, file.name),
             );
-            wait_cancel_ack();
-            return Err(cancel_error());
+            wait_cancel_ack(fb);
+            return Err(cancel_error(cancel));
         }
         let mut filled = 0usize;
         while filled < buf.len() {
@@ -200,6 +166,7 @@ pub(super) fn send_file_chunks(
             break;
         }
         offset += filled as u64;
+
         let flag = if offset >= file.size {
             3
         } else if sequence == 0 {
@@ -211,13 +178,13 @@ pub(super) fn send_file_chunks(
         batch.extend_from_slice(&wire_frame);
         batch_content += filled as u64;
         let mut flushed = false;
-        if batch.len() >= batch_limit {
+        if batch.len() >= BATCH_BYTES {
             if cancelled(&cancel) {
                 crate::trace::note(
                     "file#1",
                     &format!("取消时已发 {} 字节（本批未写）", sent),
                 );
-                return Err(cancel_error());
+                return Err(cancel_error(cancel));
             }
             chan.transmit(&batch)?;
             batch.clear();
@@ -243,7 +210,7 @@ pub(super) fn send_file_chunks(
 
         if last_draw.elapsed() >= Duration::from_millis(120) {
             last_draw = Instant::now();
-            draw_progress(*written, total, t0);
+            draw_progress(*written, total, t0, fb.peer_pct_bits.load(Ordering::Relaxed));
         }
 
         if flushed || sequence % 64 == 0 {
@@ -272,7 +239,7 @@ pub(super) fn send_file_chunks(
                                 sequence,
                                 inner
                             );
-                            draw_progress(*written, total, t0);
+                            draw_progress(*written, total, t0, fb.peer_pct_bits.load(Ordering::Relaxed));
                         }
                     }
                     6 => {
@@ -287,15 +254,15 @@ pub(super) fn send_file_chunks(
                             if !done.is_empty() {
                                 *done_trans = Some(tr);
                             }
-                            if let Ok(ack) = transfer::assemble_dfile_packet(7, 0, 0, tr, b"")
-                                .and_then(|p| transfer::dfile_seal_control(key, &p))
-                            {
+
+                            if let Ok(ack) = build_done_ack(key, tr) {
                                 let _ = chan.transmit(&ack);
                             }
                         }
                     }
-                    9 => return Err(Error::Protocol("接收端中止了本次传输".into())),
+                    9 => return Err(Error::Rejected("对方中止了这次传输".into())),
                     22 => {
+
                         flow_pauses += 1;
                         if flow_pauses <= 3 {
                             log(&format!(
@@ -307,6 +274,7 @@ pub(super) fn send_file_chunks(
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     13 => {
+
                         dbg_frame!("[kind=13·chunk] 对端收尾通知 trans={tr} size={sz}");
                     }
                     other => {
@@ -316,6 +284,7 @@ pub(super) fn send_file_chunks(
                         );
                         let hits = unknown.entry(other).or_insert(0);
                         *hits += 1;
+
                         if *hits == 1 {
                             log(&format!("[未知帧] kind={other}（发送中），已忽略"));
                         }
@@ -327,6 +296,7 @@ pub(super) fn send_file_chunks(
             break;
         }
     }
+
     if !batch.is_empty() {
         chan.transmit(&batch)?;
         progress.fetch_add(batch_content, Ordering::Relaxed);
@@ -342,7 +312,9 @@ pub(super) fn send_batch(
     log: &dyn Fn(&str),
     cancel: &AtomicBool,
     progress: &AtomicU64,
+    fb: &PeerState,
 ) -> Result<u64> {
+
     if peer.is_apple() {
         let mut congest = Vec::with_capacity(8 + 24);
         congest.extend_from_slice(&[11, 0, 0, 0, 0, 0, 0, 24]);
@@ -356,8 +328,9 @@ pub(super) fn send_batch(
 
     let entries: Vec<(u16, u64, Vec<u8>)> = files
         .iter()
-        .map(|f| (f.id, f.size, f.name.as_bytes().to_vec()))
+        .map(|f| (f.id, f.size, f.rel_path.as_bytes().to_vec()))
         .collect();
+
     for packet in transfer::build_headers(&entries, trans)? {
         chan.transmit(&transfer::dfile_seal_control(key, &packet)?)?;
     }
@@ -369,11 +342,15 @@ pub(super) fn send_batch(
 
     let mut sent: Vec<u16> = Vec::new();
     let mut done: Vec<u16> = Vec::new();
+
     let mut done_trans: Option<u16> = None;
     let mut written: u64 = 0;
     let mut last_activity = Instant::now();
+
     let mut last_progress = (0u64, 0usize, 0usize);
+
     let mut dup_requests: std::collections::BTreeMap<u16, u32> = std::collections::BTreeMap::new();
+
     let mut backpressure = 0u32;
     let deadline = Instant::now() + Duration::from_secs(3600);
     let mut next_log = 64u64 * 1024 * 1024;
@@ -387,8 +364,9 @@ pub(super) fn send_batch(
                 "file#1",
                 &format!("取消时已发 {} 字节（等待 ACK 阶段）", written),
             );
-            return Err(cancel_error());
+            return Err(cancel_error(cancel));
         }
+
         let mut handled = false;
         while let Some(wire_frame) = chan.try_read_dfile(Duration::from_millis(1))? {
             handled = true;
@@ -416,6 +394,7 @@ pub(super) fn send_batch(
                         transfer::open_control_block(key, (kind, flags, sess, trans), payload)?;
                     for id in parse_ids(&inner)? {
                         if sent.contains(&id) {
+
                             let n = dup_requests.entry(id).or_insert(0);
                             *n += 1;
                             if *n == 3 {
@@ -431,6 +410,7 @@ pub(super) fn send_batch(
                             continue;
                         }
                         let Some(file) = files.iter().find(|f| f.id == id) else {
+
                             log(&format!("[AES 对照] 对端对 id={id} 回了 kind={kind}"));
                             continue;
                         };
@@ -448,11 +428,13 @@ pub(super) fn send_batch(
                             log,
                             cancel,
                             progress,
+                            fb,
                         )?;
                         sent.push(id);
+
                         if done.len() >= files.len() {
                             let tr = done_trans.unwrap_or(trans);
-                            return finish_batch(chan, key, tr, peer.is_apple(), written, &mut oguard);
+                            return finish_batch(chan, key, tr, written, &mut oguard);
                         }
                         if written >= next_log {
                             log(&format!(
@@ -475,6 +457,7 @@ pub(super) fn send_batch(
                             done.push(*id);
                         }
                     }
+
                     log(&format!(
                         "[DONE] 收到 {} 个 id，新增 {}，累计 {}/{}",
                         ids.len(),
@@ -484,26 +467,28 @@ pub(super) fn send_batch(
                     ));
                     if done.len() >= files.len() {
                         dbg_frame!("[rx 汇总] {:?}", rx_kinds);
-                        return finish_batch(chan, key, trans, peer.is_apple(), written, &mut oguard);
+                        return finish_batch(chan, key, trans, written, &mut oguard);
                     }
-                    if let Ok(ack) = transfer::assemble_dfile_packet(7, 0, 0, trans, b"")
-                        .and_then(|p| transfer::dfile_seal_control(key, &p))
-                    {
+
+                    if let Ok(ack) = build_done_ack(key, trans) {
                         let _ = chan.transmit(&ack);
                     }
                     last_activity = Instant::now();
                 }
                 9 => return Err(Error::Protocol("接收端中止了本次传输".into())),
                 5 => {
+
                     let inner =
                         transfer::open_control_block(key, (kind, flags, sess, trans), payload)?;
                     dbg_frame!("[k5] len={} hex={:02X?}", inner.len(), inner);
                 }
                 22 => {
+
                     dbg_frame!("[kind=22·batch] 未知信号，暂停 20 ms");
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 13 => {
+
                     backpressure = backpressure.saturating_add(1);
                     if backpressure <= 3 {
                         log(&format!(
@@ -518,11 +503,13 @@ pub(super) fn send_batch(
                         "[未知帧·batch] kind={other} trans={trans} size={size} hex={:02X?}",
                         &payload[..payload.len().min(24)]
                     );
+
                     log(&format!(
                         "[未知帧] kind={other} trans={trans} size={size}，已忽略"
                     ));
                 }
             }
+
         }
         let progress = (written, sent.len(), done.len());
         if progress != last_progress {

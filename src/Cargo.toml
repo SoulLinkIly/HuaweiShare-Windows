@@ -1,19 +1,24 @@
 [package]
 name = "hwshare"
-version = "1.7.8"
+version = "1.8.0"
 edition = "2021"
 description = "华为分享协议实现 —— 同时支持鸿蒙手机 / 鸿蒙 7 与 iPad / iPhone"
 license = "GPL-3.0-only"
+repository = "https://github.com/SoulLinkIly/HuaweiShare-Windows"
+homepage = "https://github.com/SoulLinkIly/HuaweiShare-Windows"
+# 两个 bin 显式声明；src/bin/shared/app.rs 只是共享模块，不能自动发现成 bin
 autobins = false
 
 [lib]
 name = "hwshare"
 path = "src/lib.rs"
 
+# 图形界面：GUI 子系统，双击进托盘，不分配控制台
 [[bin]]
 name = "hwshare"
 path = "src/bin/hwshare.rs"
 
+# 命令行：console 子系统，只接 discover/send/serve/listen/--help
 [[bin]]
 name = "hwshare-cli"
 path = "src/bin/hwshare-cli.rs"
@@ -27,11 +32,11 @@ sha1 = "0.10"
 hmac = "0.12"
 rsa = { version = "0.9", features = ["sha2"] }
 rand = "0.8"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
+# Windows 桌面层：socket 缓冲/keepalive、文件预分配、时区，
+# 以及托盘 / 浮层 / 自绘确认框所需的 UI、GDI、Shell、COM。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -58,10 +63,11 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"
 
 [profile.dev]
 opt-level = 1

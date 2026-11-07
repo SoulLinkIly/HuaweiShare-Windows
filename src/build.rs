@@ -1,3 +1,12 @@
+//! 构建脚本：把图标与版本信息分别编进两个 exe（hwshare / hwshare-cli）。
+//!
+//! Rust 的 windows-gnu 目标不会自动带 `.rsrc`，所以 exe 在资源管理器里是白板图标、
+//! 右键属性也没有版本号。这里用 windres 把 `assets/hwshare.rc` 编成 COFF 资源对象，
+//! 再通过 `rustc-link-arg-bins` 塞进链接。
+//!
+//! windres 来自 w64devkit（或任意 mingw-w64 发行版）。找不到就跳过并在构建日志里
+//! 提醒，不让整个构建失败。
+
 use std::path::Path;
 use std::process::Command;
 
@@ -14,11 +23,14 @@ fn main() {
         return;
     }
 
+    // 两个 exe 各带一份资源：版本信息里的 OriginalFilename / FileDescription
+    // 要跟自己的文件名对得上，不能再拿一份 .res.o 喂给所有 bin。
     let jobs: [(&str, &str, &str); 2] = [
         ("hwshare", "assets/hwshare.rc", "hwshare.res.o"),
         ("hwshare-cli", "assets/hwshare-cli.rc", "hwshare-cli.res.o"),
     ];
 
+    // build.ps1 找到 windres 后会把它写进 HWSHARE_WINDRES；没设就退回 PATH 查找。
     let windres = std::env::var("HWSHARE_WINDRES")
         .ok()
         .filter(|s| !s.trim().is_empty())

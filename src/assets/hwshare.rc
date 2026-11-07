@@ -1,8 +1,8 @@
 1 ICON "assets/hwshare.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,7,8,0
-PRODUCTVERSION 1,7,8,0
+FILEVERSION 1,8,0,0
+PRODUCTVERSION 1,8,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -15,12 +15,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "hwshare"
             VALUE "FileDescription", "华为分享（Windows 端）"
-            VALUE "FileVersion", "1.7.8"
+            VALUE "FileVersion", "1.8.0"
             VALUE "InternalName", "hwshare"
             VALUE "LegalCopyright", "GPL-3.0-only"
             VALUE "OriginalFilename", "hwshare.exe"
             VALUE "ProductName", "华为分享"
-            VALUE "ProductVersion", "1.7.8"
+            VALUE "ProductVersion", "1.8.0"
         END
     END
     BLOCK "VarFileInfo"

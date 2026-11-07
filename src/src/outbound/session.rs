@@ -1,3 +1,5 @@
+//! 单次发送会话：opening → 等确认 → 数据 → 关闭。
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,39 +14,46 @@ use crate::{auth, Error, Result};
 use super::*;
 use super::dfile::ov;
 
-pub(super) fn send_once(
+const MAX_FILES_PER_TRANSACTION: usize = 100;
+
+pub(super) struct Handshake {
+    pub channel: Channel,
+    pub key: [u8; 32],
+    pub device_hash: Vec<u8>,
+    pub local: String,
+    pub identity: String,
+    pub node_id: String,
+    pub peer: transfer::PeerKind,
+
+    pub is_tablet: bool,
+}
+
+pub(super) fn do_handshake(
     peer_ip: &str,
     peer_port: u16,
-    paths: &[PathBuf],
-    display_name: &str,
     log: &dyn Fn(&str),
-    progress: &Arc<AtomicU64>,
-) -> Result<Report> {
-    let (files, skipped) = collect(paths)?;
-    if skipped > 0 {
-        log(&format!("已跳过 {skipped} 个文件夹（只发文件）"));
-    }
-    let total: u64 = files.iter().map(|f| f.size).sum();
-    let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
-
+) -> Result<Handshake> {
     let private = load_or_create_identity(None)?;
     let public_der = crypto::public_der(&private).map_err(Error::Crypto)?;
-    let digest = crate::derive_key_fingerprint(&public_der)?;
-    let device_hash: Vec<u8> = crate::hex_upper(&digest[..8]).into_bytes();
+    let device_hash: Vec<u8> = crate::device_hash(&public_der)?.into_bytes();
+
     let identity = crate::identity_v2(&public_der)?;
     let node_id = crate::derive_node_identifier(&public_der)?;
     let local = local_ipv4(peer_ip)?;
+
     log(&format!("本机地址: {local}"));
 
     let mut channel = Channel::connect(peer_ip, peer_port, Duration::from_secs(8))?;
     channel.set_label("control");
-    channel.transmit(&auth::opening_payload(&identity)?)?;
+
+    let opening = auth::opening_payload(&identity)?;
+    channel.transmit(&opening)?;
     if crate::trace::enabled() {
         crate::trace::note("control", "opening 已发，等 opening ACK");
     }
     let opening_ack = channel.read_channel_frame(Duration::from_secs(10))?;
-    let module = u32::from_le_bytes(opening_ack[4..8].try_into().unwrap());
-    let flags = u32::from_le_bytes(opening_ack[16..20].try_into().unwrap());
+    let module = crate::u32_at(&opening_ack, 4).ok_or(Error::Truncated)?;
+    let flags = crate::u32_at(&opening_ack, 16).ok_or(Error::Truncated)?;
     if module != 8 || flags != 1 {
         return Err(Error::Protocol("对方拒绝建立认证通道（可能正忙）".into()));
     }
@@ -64,6 +73,7 @@ pub(super) fn send_once(
             .unwrap_or(0)
     };
     let is_tablet = peer_route_type == 2;
+
     let peer = if is_tablet {
         transfer::PeerKind::Apple
     } else {
@@ -77,13 +87,24 @@ pub(super) fn send_once(
     }
 
     const MACHINE: &str = "AMD64";
-    if is_tablet {
-        channel.transmit(&auth::capabilities_short(&device_hash)?)?;
-        log("已发 39 字节能力帧（iPad 形态）");
+    let cap_bytes = if peer.is_apple() {
+        auth::capabilities_phone(&device_hash)?
     } else {
-        channel.transmit(&auth::local_capability_frame(&device_hash, "10.0", MACHINE)?)?;
+        auth::local_capability_frame(&device_hash, "10.0", MACHINE)?
+    };
+    channel.transmit(&cap_bytes)?;
+    if peer.is_apple() {
+        log("已发 39 字节能力帧（手机形态：TLV 1/5/6，版本报空）");
+    } else {
+        log("已发 46 字节能力帧（鸿蒙形态）");
     }
+
+    let t_cap = Instant::now();
     let mut capability_response = channel.read_channel_frame(Duration::from_secs(12))?;
+    log(&format!(
+        "能力帧 → 对方首帧：{} ms",
+        t_cap.elapsed().as_millis()
+    ));
 
     let cap_is_probe = auth::envelope_mode(&capability_response) == Some(2);
     if cap_is_probe {
@@ -103,17 +124,24 @@ pub(super) fn send_once(
             return Err(Error::Protocol("对方未回应能力协商".into()));
         }
         if is_next_recv {
+
             log("收到 next_recv，等预交换探针（mode=2）后再发公钥");
             let deadline = Instant::now() + Duration::from_secs(8);
+            let mut got_probe = false;
             while Instant::now() < deadline {
                 match channel.try_read_frame(Duration::from_millis(200)) {
                     Ok(Some(f)) if auth::envelope_mode(&f) == Some(2) => {
                         capability_response = f;
+                        got_probe = true;
                         break;
                     }
                     Ok(_) => {}
                     Err(_) => break,
                 }
+            }
+
+            if !got_probe {
+                return Err(Error::Busy);
             }
         }
     }
@@ -127,7 +155,7 @@ pub(super) fn send_once(
         }
         break wire_frame;
     };
-    let handshake = auth::auth_challenge_payload(
+    let challenge = auth::auth_challenge_payload(
         &mut channel,
         &device_hash,
         &peer_public_response,
@@ -135,24 +163,106 @@ pub(super) fn send_once(
         &private,
         Duration::from_secs(10),
     )?;
-    let key = handshake.session_key;
+    let key = challenge.session_key;
+    log(&format!(
+        "挑战完成：mgf_sha1={} key={:02x}{:02x}...",
+        challenge.mgf_sha1, key[0], key[1]
+    ));
+    Ok(Handshake {
+        channel,
+        key,
+        device_hash,
+        local,
+        identity,
+        node_id,
+        peer,
+        is_tablet,
+    })
+}
 
-    let offer = build_offer(&names, total, display_name, None, is_tablet)?;
+fn send_encrypted(
+    ch: &mut Channel,
+    dh: &[u8],
+    key: &[u8],
+    body: Vec<u8>,
+    seq: &mut u64,
+) -> Result<()> {
+    ch.transmit(&transfer::seal_encrypted_frame(dh, key, &body, *seq)?)?;
+    *seq += 1;
+    Ok(())
+}
+
+pub(super) fn send_once(
+    peer_ip: &str,
+    peer_port: u16,
+    paths: &[PathBuf],
+    display_name: &str,
+    log: &dyn Fn(&str),
+    progress: &Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Report> {
+    let Collected { files, skipped, top_dirs, empty_dirs } = collect(paths)?;
+    if skipped > 0 {
+        log(&format!("已跳过 {skipped} 个空目录/非文件条目"));
+    }
+    if empty_dirs > 0 {
+        log(&format!(
+            "有 {empty_dirs} 个空文件夹没有随行（对端清单按文件传，无法表达空目录）"
+        ));
+    }
+    if top_dirs > 0 {
+        log(&format!("含 {top_dirs} 个文件夹，将按相对路径发送"));
+    }
+    let total: u64 = files.iter().map(|f| f.size).sum();
+    let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
+
+    let Handshake {
+        mut channel,
+        key,
+        device_hash,
+        local,
+        identity,
+        node_id,
+        peer,
+        is_tablet,
+        ..
+    } = {
+
+        ov::set_batch(files.len());
+        ov::set_outgoing(true);
+        ov::preparing(files.first().map(|f| f.name.as_str()).unwrap_or("正在准备"));
+
+        do_handshake(peer_ip, peer_port, log)?
+    };
+
+    let offer = build_offer(&names, total, display_name, None, peer.is_apple(), top_dirs)?;
     channel.transmit(&transfer::seal_encrypted_frame(&device_hash, &key, &offer, 5)?)?;
+    let scope_text = if top_dirs > 0 {
+        format!("{top_dirs} 个文件夹 · ")
+    } else {
+        String::new()
+    };
     if crate::trace::enabled() {
         crate::trace::note(
             "control",
-            &format!("offer 已发：{} 个文件，共 {} 字节", names.len(), total),
+            &format!(
+                "offer 已发：{scope_text}{} 个文件，共 {} 字节（tag3/tag6={}）",
+                names.len(),
+                total,
+                names.len()
+            ),
         );
     }
     log(&format!(
-        "已发出分享请求：{} 个文件，{:.1} MB",
+        "已发出分享请求：{scope_text}{} 个文件，{:.1} MB",
         files.len(),
         total as f64 / 1048576.0
     ));
 
     let _wait_guard = SendOverlayGuard { done: false };
-    ov::set_multi(files.len());
+
+    ov::set_batch(files.len());
+
     ov::set_outgoing(true);
     ov::waiting(files.first().map(|f| f.name.as_str()).unwrap_or("正在发送"));
 
@@ -169,11 +279,14 @@ pub(super) fn send_once(
     let deadline = Instant::now() + Duration::from_secs(120);
 
     while Instant::now() < deadline {
+
         let wire_frame = match channel.try_read_frame(Duration::from_millis(200)) {
             Ok(Some(f)) => f,
             Ok(None) => {
-                if send_cancel_requested() {
+                if cancel.load(Ordering::Relaxed) {
+
                     send_sender_cancel(&mut channel, &device_hash, &key, &mut sequence);
+
                     std::thread::sleep(CANCEL_WAIT);
                     crate::trace::note("control", "尚未开始传输时取消：已发 senderCancel，关闭控制通道");
                     return Err(Error::Protocol("已取消发送（对方尚未接收）".into()));
@@ -182,7 +295,7 @@ pub(super) fn send_once(
             }
             Err(_) => continue,
         };
-        let module = u32::from_le_bytes(wire_frame[4..8].try_into().unwrap());
+        let module = crate::u32_at(&wire_frame, 4).ok_or(Error::Truncated)?;
 
         if module == 9 {
             let body = match transfer::open_channel_frame(&wire_frame, &key) {
@@ -199,23 +312,25 @@ pub(super) fn send_once(
                                 }
                                 b"user_confirm" => {
                                     log("对方已接受，正在建立数据通道");
+
                                     if !exchange_sent {
-                                        channel.transmit(&transfer::seal_encrypted_frame(
+                                        send_encrypted(
+                                            &mut channel,
                                             &device_hash,
                                             &key,
-                                            &net_info_offer(&local)?,
-                                            sequence,
-                                        )?)?;
-                                        sequence += 1;
-                                        channel.transmit(&transfer::seal_encrypted_frame(
+                                            net_info_offer(&local)?,
+                                            &mut sequence,
+                                        )?;
+                                        send_encrypted(
+                                            &mut channel,
                                             &device_hash,
                                             &key,
-                                            &logical_addr(&local)?,
-                                            sequence,
-                                        )?)?;
-                                        sequence += 1;
+                                            logical_addr(&local)?,
+                                            &mut sequence,
+                                        )?;
                                         exchange_sent = true;
                                     }
+
                                     if is_tablet && !meta_sent {
                                         send_meta(
                                             &mut channel,
@@ -234,23 +349,25 @@ pub(super) fn send_once(
                             }
                         }
                     }
+
                     4 => {
-                        channel.transmit(&transfer::seal_encrypted_frame(
+                        send_encrypted(
+                            &mut channel,
                             &device_hash,
                             &key,
-                            &net_info_reply(&local)?,
-                            sequence,
-                        )?)?;
-                        sequence += 1;
+                            net_info_reply(&local)?,
+                            &mut sequence,
+                        )?;
                     }
+
                     10 => {
-                        channel.transmit(&transfer::seal_encrypted_frame(
+                        send_encrypted(
+                            &mut channel,
                             &device_hash,
                             &key,
-                            &logical_addr(&local)?,
-                            sequence,
-                        )?)?;
-                        sequence += 1;
+                            logical_addr(&local)?,
+                            &mut sequence,
+                        )?;
                     }
                     _ => {}
                 }
@@ -264,6 +381,7 @@ pub(super) fn send_once(
         };
 
         if header.0 == PEER_META_FRAME {
+
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&plain) {
                 let name = v.get("DEVICE_NAME").and_then(|x| x.as_str()).unwrap_or("");
                 let tid = v.get("DEVICE_TYPE_ID").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -275,7 +393,8 @@ pub(super) fn send_once(
                     ));
                 }
             }
-            if peer.is_apple() {
+
+            if is_tablet {
                 if !meta_sent {
                     send_meta(
                         &mut channel,
@@ -304,6 +423,7 @@ pub(super) fn send_once(
 
         if header.0 == PEER_META_ACK_FRAME && !code3_sent {
             let (local_port, p2p_listener) = reserve_port(&local)?;
+
             std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(180);
                 while Instant::now() < deadline {
@@ -360,6 +480,7 @@ pub(super) fn send_once(
                 ack_plain.strip_suffix(&[0]).unwrap_or(&ack_plain),
             )
             .map_err(|_| Error::Format)?;
+
             if ack_header.1 != 6 || (ack_header.3 != 0x95 && ack_header.3 != 0x91) || ack["CODE"] != 1 {
                 return Err(Error::Protocol(format!(
                     "byte 通道握手被拒绝（flags=0x{:02X}）",
@@ -371,7 +492,7 @@ pub(super) fn send_once(
             }
             log("预览通道已建立");
 
-            if peer.is_apple() && !preview_sent_early {
+            if is_tablet && !preview_sent_early {
                 let body = build_preview_payload(&files)?;
                 let inner = transfer::encrypted_envelope(&device_hash, &key, &body)?;
                 chan.transmit(&transfer::bytes_frame(&bkey, &inner, 0)?)?;
@@ -410,8 +531,10 @@ pub(super) fn send_once(
 
             let mut chan = Channel::connect(&ip, port, Duration::from_secs(8))?;
             chan.set_label("file#1");
+
             let chunk = chunk_size();
             let frame_size = data_frame_size(chunk);
+
             log(&format!("分块: {chunk} B（帧长 {frame_size}）"));
             let profile = settings_profile(peer, frame_size);
             log(&format!(
@@ -422,6 +545,7 @@ pub(super) fn send_once(
                 if peer.is_apple() { "（Apple 档）" } else { "（鸿蒙档）" }
             ));
             chan.transmit(&profile.encode())?;
+
             let reply = match chan.try_read_dfile(Duration::from_secs(10))? {
                 Some(r) => r,
                 None => return Err(Error::Protocol("对端未回应 DFile settings".into())),
@@ -431,14 +555,17 @@ pub(super) fn send_once(
                 return Err(Error::Protocol(format!("DFile settings 应答异常 kind={kind}")));
             }
             let payload = &reply[8..8 + size];
+
             if payload.len() < 100 || u16::from_be_bytes([payload[2], payload[3]]) != 2 {
                 return Err(Error::Protocol("对端 DFile settings 档位不兼容".into()));
             }
+
             if !peer.is_apple()
                 && u32::from_be_bytes([payload[96], payload[97], payload[98], payload[99]]) & 1 == 0
             {
                 return Err(Error::Protocol("对端 DFile 能力不支持加密传输".into()));
             }
+
             {
                 let be16 = |i: usize| u16::from_be_bytes([payload[i], payload[i + 1]]);
                 let be32 = |i: usize| {
@@ -470,9 +597,10 @@ pub(super) fn send_once(
             let mut bchan_slot = Some(byte_channel.take().ok_or(Error::Format)?);
             let mut bkey_slot = Some(byte_key.ok_or(Error::Format)?);
 
-            let cancel = Arc::new(AtomicBool::new(false));
             let stop = Arc::new(AtomicBool::new(false));
             let peer_closed = Arc::new(AtomicBool::new(false));
+
+            let fb = Arc::new(PeerState::new());
             let watcher = spawn_control_watch(
                 channel,
                 key,
@@ -482,12 +610,14 @@ pub(super) fn send_once(
                 cancel.clone(),
                 stop.clone(),
                 peer_closed.clone(),
+                fb.clone(),
             );
 
             let result = (|| -> Result<u64> {
                 let mut bchan = bchan_slot.take().ok_or(Error::Format)?;
                 let bkey = bkey_slot.take().ok_or(Error::Format)?;
-                let preview_wait = if peer.is_apple() { 800 } else { 15_000 };
+
+                let preview_wait = if is_tablet { 800 } else { 15_000 };
                 send_preview(
                     &mut bchan,
                     &bkey,
@@ -496,39 +626,37 @@ pub(super) fn send_once(
                     &files,
                     log,
                     &cancel,
+                    &fb,
                     !preview_sent_early,
                     preview_wait,
-                    !peer.is_apple(),
+                    !is_tablet,
                 )?;
                 if cancelled(&cancel) {
                     crate::trace::note("control", "预览阶段收到取消，停止发送");
-                    return Err(cancel_error());
+                    return Err(cancel_error(&cancel));
                 }
-                spawn_byte_watch(bchan, bkey, key, stop.clone());
+
+                spawn_byte_watch(bchan, bkey, key, stop.clone(), fb.clone());
 
                 let (mut first, first_key) = pool.remove(0);
-                let per_trans: usize = std::env::var("HWSHARE_TRANS_FILES")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(100);
+
                 let mut sent: u64 = 0;
                 let mut group_no: u16 = 0;
-                for group in files.chunks(per_trans.max(1)) {
+                for group in files.chunks(MAX_FILES_PER_TRANSACTION) {
                     if group_no > 0 {
-                        let gap: u64 = std::env::var("HWSHARE_BATCH_GAP_MS")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(1500);
+
+                        let gap: u64 = crate::env::num("HWSHARE_BATCH_GAP_MS", 500);
                         std::thread::sleep(Duration::from_millis(gap));
                     }
                     group_no += 1;
-                    if files.len() > per_trans.max(1) {
+                    if files.len() > MAX_FILES_PER_TRANSACTION {
                         log(&format!(
                             "第 {group_no} 批：{} 个文件（事务 {}）",
                             group.len(),
                             group_no
                         ));
                     }
+
                     let mut group_files: Vec<Outgoing> = group.to_vec();
                     for (i, f) in group_files.iter_mut().enumerate() {
                         f.id = (i + 1) as u16;
@@ -542,26 +670,44 @@ pub(super) fn send_once(
                         log,
                         &cancel,
                         progress,
+                        &fb,
                     )?;
                 }
-                let grace_ms: u64 = std::env::var("HWSHARE_GRACE_MS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1200);
+
+                let grace_ms: u64 = crate::env::num("HWSHARE_GRACE_MS", 1200);
                 first.graceful_close(Duration::from_millis(grace_ms));
                 Ok(sent)
             })();
 
             let written = result?;
-            let wait_ms = if is_tablet { 1500 } else { 15_000 };
+
+            let bits = fb.peer_pct_bits.load(Ordering::SeqCst);
+            let mut peer_at_100 = bits != u64::MAX && f64::from_bits(bits) >= 100.0;
+            let wait_ms: u64 = if peer_at_100 {
+                0
+            } else if is_tablet {
+                1500
+            } else {
+                15_000
+            };
+
             let deadline = Instant::now() + Duration::from_millis(wait_ms);
             while Instant::now() < deadline && !peer_closed.load(Ordering::SeqCst) {
+                if !peer_at_100 {
+                    let cur = fb.peer_pct_bits.load(Ordering::Relaxed);
+                    if cur != u64::MAX && f64::from_bits(cur) >= 100.0 {
+                        peer_at_100 = true;
+                        break;
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
             crate::trace::note(
                 "control",
                 if peer_closed.load(Ordering::SeqCst) {
                     "对端已先关闭连接"
+                } else if peer_at_100 {
+                    "对端已报 100%，立即关闭"
                 } else {
                     "主动关闭连接（对端等我们关）"
                 },

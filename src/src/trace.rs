@@ -1,3 +1,6 @@
+//! 二进制 trace 落盘（`HWSHARE_TRACE` 开关），用于抓包复核。
+
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -9,10 +12,22 @@ use serde_json::{json, Map, Value};
 
 pub const FORMAT_VERSION: u64 = 1;
 
+thread_local! {
+    /// 当前线程正在处理的会话 id。
+    ///
+    /// 以前 sid 是**进程级**一个，几路并发时所有 `session.start` / `channel.*` 的 sid 完全相同，
+    /// 事后按 sid 归并会把 A 的 start 和 B 的 end 配成一对（复盘时出现过
+    /// "声明 377 MB / 实收 19 MB" 的假警报）。现在改成一会话一个 id。
+    static SESSION_SID: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
+
     Skeleton,
+
     Frames,
+
     Bytes,
 }
 
@@ -46,17 +61,23 @@ impl Scope {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub path: PathBuf,
+
     pub peer: Option<String>,
+
     pub local: Option<String>,
     pub scope: Scope,
     pub session_id: String,
+
     pub source: String,
+
     pub max_bytes: u64,
 }
 
 struct Sink {
     cfg: Config,
     out: BufWriter<File>,
+
+    flush_each: bool,
     t0: Instant,
     wall0_ms: u128,
     captured: u64,
@@ -122,6 +143,7 @@ fn pid() -> u32 {
 }
 
 pub fn make_session_id() -> String {
+
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -148,10 +170,7 @@ fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 pub fn default_dir() -> PathBuf {
-    match std::env::var_os("LOCALAPPDATA") {
-        Some(base) => PathBuf::from(base).join("HWShareWin").join("sessions"),
-        None => std::env::temp_dir().join("HWShareWin").join("sessions"),
-    }
+    crate::store::home().join("sessions")
 }
 
 pub fn start(cfg: Config) -> std::io::Result<PathBuf> {
@@ -168,6 +187,7 @@ pub fn start(cfg: Config) -> std::io::Result<PathBuf> {
     let mut sink = Sink {
         cfg,
         out: BufWriter::with_capacity(256 * 1024, file),
+        flush_each: crate::env::unless_zero("HWSHARE_TRACE_FLUSH"),
         t0: Instant::now(),
         wall0_ms: now_ms(),
         captured: 0,
@@ -209,28 +229,24 @@ pub fn init_from_env() {
     if enabled() {
         return;
     }
-    if std::env::var("HWSHARE_TRACE").is_err() {
+    if !crate::env::present("HWSHARE_TRACE") {
         return;
     }
     let sid = make_session_id();
     let default_scope = Scope::Frames;
-    let scope = std::env::var("HWSHARE_TRACE_SCOPE")
-        .ok()
+    let scope = crate::env::text("HWSHARE_TRACE_SCOPE")
         .and_then(|s| Scope::parse(&s))
         .unwrap_or(default_scope);
-    let path = match std::env::var("HWSHARE_TRACE_OUT") {
-        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+    let path = match crate::env::text("HWSHARE_TRACE_OUT") {
+        Some(p) if !p.trim().is_empty() => PathBuf::from(p),
         _ => default_dir().join(format!("capture-{sid}.jsonl")),
     };
-    let peer = std::env::var("HWSHARE_TRACE_PEER")
-        .ok()
+    let peer = crate::env::text("HWSHARE_TRACE_PEER")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let local = std::env::var("HWSHARE_TRACE_LOCAL").ok().filter(|s| !s.is_empty());
-    let max_bytes = std::env::var("HWSHARE_TRACE_MAX_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(512)
+    let local = crate::env::text("HWSHARE_TRACE_LOCAL").filter(|s| !s.is_empty());
+
+    let max_bytes = crate::env::num("HWSHARE_TRACE_MAX_MB", 512u64)
         .saturating_mul(1024 * 1024);
     let cfg = Config {
         path,
@@ -272,6 +288,18 @@ pub fn finish(reason: &str) {
     *guard = None;
 }
 
+/// 会话线程用本线程的 id，主线程（capture.meta / capture.end）退回进程级 id。
+fn current_sid(fallback: &str) -> String {
+    SESSION_SID.with(|s| {
+        let v = s.borrow();
+        if v.is_empty() {
+            fallback.to_string()
+        } else {
+            v.clone()
+        }
+    })
+}
+
 fn push(map: &mut Map<String, Value>, key: &str, value: Value) {
     map.insert(key.to_string(), value);
 }
@@ -289,7 +317,7 @@ fn emit(ev: &str, peer: Option<&str>, mut fields: Map<String, Value>) {
     }
     push(&mut fields, "v", json!(FORMAT_VERSION));
     push(&mut fields, "ev", json!(ev));
-    push(&mut fields, "sid", json!(sink.cfg.session_id.clone()));
+    push(&mut fields, "sid", json!(current_sid(&sink.cfg.session_id)));
     push(&mut fields, "t", json!(sink.t0.elapsed().as_micros() as u64));
     push(&mut fields, "wall", json!(now_ms()));
     if let Some(p) = peer {
@@ -298,7 +326,10 @@ fn emit(ev: &str, peer: Option<&str>, mut fields: Map<String, Value>) {
     let line = Value::Object(fields);
     let _ = sink.out.write_all(line.to_string().as_bytes());
     let _ = sink.out.write_all(b"\n");
-    let _ = sink.out.flush();
+
+    if sink.flush_each {
+        let _ = sink.out.flush();
+    }
     EVENTS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -322,8 +353,11 @@ fn hex_text(data: &[u8], limit: usize) -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameKind {
+
     Babeface { module: u32, seq: u64, flags: u32, len: u32 },
+
     Dfile { kind: u8, flags: u8, session: u16, transaction: u16, size: u16 },
+
     Raw,
 }
 
@@ -345,6 +379,7 @@ pub fn classify(data: &[u8]) -> FrameKind {
     if data.len() >= 8 {
         let kind = data[0];
         let size = u16::from_be_bytes([data[6], data[7]]);
+
         if (1..=14).contains(&kind) || kind == 22 {
             if 8 + size as usize == data.len() {
                 return FrameKind::Dfile {
@@ -366,6 +401,8 @@ pub fn session_start(mode: &str, peer: &str, local: &str, files: usize, bytes: u
     if !enabled() {
         return;
     }
+    // 每个会话线程拿一个独立 id，并发时才能按 sid 分开。
+    SESSION_SID.with(|s| *s.borrow_mut() = make_session_id());
     let mut f = obj();
     push(&mut f, "dir", json!(mode));
     push(&mut f, "local", json!(local));
@@ -384,7 +421,9 @@ pub fn session_end(ok: bool, bytes: u64, files: &[String], reason: &str, dur_ms:
     push(&mut f, "files", json!(files));
     push(&mut f, "reason", json!(reason));
     push(&mut f, "dur_ms", json!(dur_ms as u64));
+
     emit("session.end", None, f);
+    SESSION_SID.with(|s| s.borrow_mut().clear());
 }
 
 pub fn channel_open(label: &str, role: &str, laddr: &str, raddr: &str, conn: u64) {
@@ -448,6 +487,7 @@ pub fn wire_frame(channel: &str, dir: &str, data: &[u8], conn: u64) {
             push(&mut f, "proto", json!("raw"));
         }
     }
+
     let limit = if scope() == Scope::Bytes { data.len() } else { 64 };
     push(&mut f, "hex", json!(hex_text(data, limit)));
     emit("frame", None, f);
@@ -763,7 +803,7 @@ mod tests {
         let path = temp_path("limit");
         start_with(&path, None, Scope::Bytes, 100);
         bytes("control", "rx", &[1u8; 60], 1);
-        bytes("control", "rx", &[2u8; 60], 1); 
+        bytes("control", "rx", &[2u8; 60], 1);
         bytes("control", "rx", &[3u8; 60], 1);
         finish("test");
         let all = lines(&path);

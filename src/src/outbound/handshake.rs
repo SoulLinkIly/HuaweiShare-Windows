@@ -1,3 +1,5 @@
+//! 发送侧握手细节：字节握手、文件通道请求、逻辑地址与元数据。
+
 use base64::Engine;
 use rand::RngCore;
 
@@ -25,6 +27,7 @@ pub(super) fn is_private_ipv4(ip: &str) -> bool {
                 || (o[0] == 172 && (16..=31).contains(&o[1]))
                 || (o[0] == 192 && o[1] == 168)
                 || (o[0] == 169 && o[1] == 254)
+                || o[0] == 127
         }
         Err(_) => false,
     }
@@ -37,6 +40,7 @@ pub(super) fn byte_handshake(
     byte_key: &[u8],
     kind: transfer::PeerKind,
 ) -> Result<Vec<u8>> {
+
     let device_id = if kind.is_apple() { node_id } else { identity };
     let (client_bus, tc, bt, flags) = if kind.is_apple() {
         (
@@ -49,8 +53,9 @@ pub(super) fn byte_handshake(
         ("IShareSenderBytesSession".to_string(), 0u32, 1u32, BYTES_FLAG_REQUEST)
     };
     let payload = format!(
-        r#"{{"CODE":1,"API_VERSION":2,"BUS_NAME":"IShareReceiverBytesSession","CLIENT_BUS_NAME":"{client_bus}","PKG_NAME":"ohos.InterConnection.iShare","MTU_SIZE":4194304,"TRANS_CAPABILITY":{tc},"ROUTE_TYPE":2,"DEVICE_ID":"{device_id}","BUSINESS_TYPE":{bt},"TRANS_FLAGS":2,"SESSION_KEY":"{key}"}}"#,
-        key = b64(byte_key)
+        r#"{{"CODE":1,"API_VERSION":2,"BUS_NAME":"IShareReceiverBytesSession","CLIENT_BUS_NAME":"{client_bus}","PKG_NAME":"{pkg}","MTU_SIZE":4194304,"TRANS_CAPABILITY":{tc},"ROUTE_TYPE":2,"DEVICE_ID":"{device_id}","BUSINESS_TYPE":{bt},"TRANS_FLAGS":2,"SESSION_KEY":"{key}"}}"#,
+        key = b64(byte_key),
+        pkg = crate::auth::PKG_NAME
     );
     let mut body = payload.into_bytes();
     body.push(0);
@@ -71,23 +76,24 @@ pub(super) fn file_channel_request(
     kind: transfer::PeerKind,
 ) -> Result<Vec<u8>> {
     let key = b64(file_key);
+
     let device_id = if kind.is_apple() { node_id } else { identity };
+
     let udp_tail = if kind.is_apple() {
         r#","UDP_CHANNEL_CAPABILITY":0"#
     } else {
         ""
     };
-    let udp_conn: u8 = std::env::var("HWSHARE_UDP_CONN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+
     let payload = if kind.is_apple() {
         format!(
-            r#"{{"MY_CHANNEL_ID":2,"MY_IP":"{local}","DEVICE_ID":"{device_id}","CODE":1538,"API_VERSION":2,"CHANNEL_TYPE":1,"STREAM_TYPE":0,"UDP_CONN_TYPE":1,"BUS_NAME":"IShareReceiverFileSession","BUSINESS_TYPE":3,"CLIENT_BUS_NAME":"IShareSenderFileSession_{identity}","PKG_NAME":"ohos.InterConnection.iShare","TRANS_CAPABILITY":19{udp_tail},"SESSION_KEY":"{key}"}}"#
+            r#"{{"MY_CHANNEL_ID":2,"MY_IP":"{local}","DEVICE_ID":"{device_id}","CODE":1538,"API_VERSION":2,"CHANNEL_TYPE":1,"STREAM_TYPE":0,"UDP_CONN_TYPE":1,"BUS_NAME":"IShareReceiverFileSession","BUSINESS_TYPE":3,"CLIENT_BUS_NAME":"IShareSenderFileSession_{identity}","PKG_NAME":"{pkg}","TRANS_CAPABILITY":19{udp_tail},"SESSION_KEY":"{key}"}}"#,
+            pkg = crate::auth::PKG_NAME
         )
     } else {
         format!(
-            r#"{{"MY_CHANNEL_ID":1,"MY_IP":"{local}","DEVICE_ID":"{device_id}","CODE":1538,"API_VERSION":2,"BUSINESS_TYPE":3,"STREAM_TYPE":255,"CHANNEL_TYPE":1,"UDP_CONN_TYPE":{udp_conn},"BUS_NAME":"IShareReceiverFileSession","CLIENT_BUS_NAME":"IShareSenderFileSession","PKG_NAME":"ohos.InterConnection.iShare","TRANS_CAPABILITY":0,"SESSION_KEY":"{key}"}}"#
+            r#"{{"MY_CHANNEL_ID":1,"MY_IP":"{local}","DEVICE_ID":"{device_id}","CODE":1538,"API_VERSION":2,"BUSINESS_TYPE":3,"STREAM_TYPE":255,"CHANNEL_TYPE":1,"UDP_CONN_TYPE":1,"BUS_NAME":"IShareReceiverFileSession","CLIENT_BUS_NAME":"IShareSenderFileSession","PKG_NAME":"{pkg}","TRANS_CAPABILITY":0,"SESSION_KEY":"{key}"}}"#,
+            pkg = crate::auth::PKG_NAME
         )
     };
     let mut body = payload.into_bytes();
@@ -114,6 +120,7 @@ pub(super) fn send_meta(
         (transfer::PeerKind::Harmony, Some(h)) => h.2,
         _ => u64::from_le_bytes(raw),
     };
+
     let info_header = match (kind, peer_header) {
         (transfer::PeerKind::Harmony, Some(h)) => h,
         _ => (PEER_META_FRAME, 5, inner_seq, 0, 0),

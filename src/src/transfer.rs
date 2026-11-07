@@ -1,9 +1,11 @@
+//! 传输公共层：帧加解密、TLV 列表、文件元数据与分块常量。
+
 use rand::RngCore;
 
 use crate::auth::{open_envelope, require_tlv};
 use crate::{
     aesgcm_decrypt, aesgcm_decrypt_n16, aesgcm_encrypt, aesgcm_encrypt_n16, frame_encode,
-    tlv_encode, varint_decode, varint_encode, Error, Result, FRAME_HEADER_SIZE, FRAME_MAGIC_WORD,
+    tlv_encode, varint_decode, varint_encode, Error, Result, FRAME_HEADER_SIZE,
 };
 
 pub fn tlv_list(data: &[u8]) -> Result<Vec<(u64, Vec<u8>)>> {
@@ -50,6 +52,7 @@ pub fn encrypted_envelope(device_hash: &[u8], key: &[u8], body: &[u8]) -> Result
 }
 
 pub fn open_channel_frame(wire_frame: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+
     let (mode, ciphertext) = open_envelope(wire_frame)?;
     if mode != 2 {
         return Err(Error::Format);
@@ -216,11 +219,14 @@ pub struct SettingsProfile {
     pub data_frame_size: u32,
     pub caps_check: u32,
     pub tail: (u32, u32),
+
     pub name: &'static str,
+
     pub exact_tail: Option<(u32, u32, u32)>,
 }
 
 impl SettingsProfile {
+
     pub fn sender_baseline(mtu: u16, data_frame_size: u16) -> Self {
         Self {
             encrypt_headers: true,
@@ -230,6 +236,7 @@ impl SettingsProfile {
             abm_capability: 0,
             capability: 0,
             data_frame_size: data_frame_size as u32,
+
             caps_check: 0x144,
             tail: (0, 1),
             name: "",
@@ -247,6 +254,7 @@ impl SettingsProfile {
             capability: 0,
             data_frame_size: data_frame_size as u32,
             caps_check: if encrypt_headers { 0x100 } else { 0 },
+
             tail: (0, OUR_CIPHER_CAPS),
             name: "",
             exact_tail: None,
@@ -265,6 +273,7 @@ impl SettingsProfile {
             caps_check: 0x36C,
             tail: (10, 7),
             name: "unknown",
+
             exact_tail: Some((1, 10, OUR_CIPHER_CAPS)),
         }
     }
@@ -285,6 +294,7 @@ impl SettingsProfile {
         payload.extend_from_slice(&self.data_frame_size.to_be_bytes());
         payload.extend_from_slice(&self.caps_check.to_be_bytes());
         match self.exact_tail {
+
             Some((a, b, c)) => {
                 let mut name = [0u8; 65];
                 let nb = self.name.as_bytes();
@@ -297,6 +307,7 @@ impl SettingsProfile {
                 payload.extend_from_slice(&b.to_le_bytes());
                 payload.extend_from_slice(&c.to_le_bytes());
             }
+
             None => {
                 payload.extend_from_slice(&[0u8; 67]);
                 payload.push(u8::from(self.encrypt_headers));
@@ -342,14 +353,11 @@ pub fn parse_dfile_header(data: &[u8]) -> Result<(u8, u8, u16, u16, usize)> {
     let session = u16::from_be_bytes([data[2], data[3]]);
     let transaction = u16::from_be_bytes([data[4], data[5]]);
     let size = u16::from_be_bytes([data[6], data[7]]) as usize;
+
     if !(1..=31).contains(&kind) {
         return Err(Error::Format);
     }
     Ok((kind, flags, session, transaction, size))
-}
-
-pub fn channel_magic() -> u32 {
-    FRAME_MAGIC_WORD
 }
 
 pub const DFILE_AAD: &[u8] = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -362,6 +370,7 @@ pub const OUR_CIPHER_CAPS: u32 = CIPHER_CLEAR | CIPHER_CHACHA | CIPHER_AES;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cipher {
+
     Clear,
     Aes128Gcm,
     ChaCha20Poly1305,
@@ -373,7 +382,9 @@ thread_local! {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PeerKind {
+
     Harmony,
+
     Apple,
 }
 
@@ -397,6 +408,7 @@ pub fn peer_kind() -> PeerKind {
 
 pub fn choose_cipher(peer_caps: Option<u32>) -> Cipher {
     let Some(caps) = peer_caps else {
+
         return if peer_kind().is_apple() {
             Cipher::ChaCha20Poly1305
         } else {
@@ -406,8 +418,10 @@ pub fn choose_cipher(peer_caps: Option<u32>) -> Cipher {
     let has_aes = caps & CIPHER_AES != 0;
     let has_chacha = caps & CIPHER_CHACHA != 0;
     if !has_aes && has_chacha {
+
         Cipher::ChaCha20Poly1305
     } else if has_aes {
+
         Cipher::Aes128Gcm
     } else if has_chacha {
         Cipher::ChaCha20Poly1305
@@ -422,6 +436,7 @@ pub fn negotiate_cipher(peer_caps: Option<u32>) -> Cipher {
     if let Some(caps) = peer_caps {
         let has_aes = caps & CIPHER_AES != 0;
         let has_chacha = caps & CIPHER_CHACHA != 0;
+
         if has_chacha {
             set_peer_kind(if has_aes {
                 PeerKind::Harmony
@@ -488,6 +503,7 @@ fn dfile_stamp_for(kind: PeerKind) -> u64 {
 fn boot_micros() -> u64 {
     #[cfg(windows)]
     {
+
         extern "system" {
             fn QueryPerformanceCounter(v: *mut i64) -> i32;
             fn QueryPerformanceFrequency(v: *mut i64) -> i32;
@@ -611,7 +627,9 @@ pub fn open_control_block(key: &[u8], header: (u8, u8, u16, u16), payload: &[u8]
     Ok(plain[8..].to_vec())
 }
 
-pub const DFILE_MAX_CONTENT: usize = 65535 - 50;
+pub const DFRAME_OVERHEAD: usize = 50;
+
+pub const DFILE_MAX_CONTENT: usize = u16::MAX as usize - DFRAME_OVERHEAD;
 
 pub fn build_data_block(key: &[u8], content: &[u8], sequence: u32, flags: u8, file_id: u16, trans: u16) -> Result<Vec<u8>> {
     if content.is_empty() || content.len() > DFILE_MAX_CONTENT || !matches!(flags, 0 | 1 | 3) || file_id == 0 {
@@ -623,6 +641,7 @@ pub fn build_data_block(key: &[u8], content: &[u8], sequence: u32, flags: u8, fi
     let mut plain = Vec::with_capacity(8 + content.len());
     plain.extend_from_slice(&file_id.to_be_bytes());
     plain.extend_from_slice(&sequence.to_be_bytes());
+
     plain.extend_from_slice(&trans.to_be_bytes());
     plain.extend_from_slice(content);
 
@@ -661,11 +680,8 @@ pub fn build_headers(entries: &[(u16, u64, Vec<u8>)], trans: u16) -> Result<Vec<
         return Err(Error::Argument);
     }
     let count = entries.len() as u16;
+
     const FRAME_BUDGET: usize = 1423;
-    let cap: usize = std::env::var("HWSHARE_MANIFEST_CHUNK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
 
     let mut frames: Vec<Vec<u8>> = Vec::new();
     let mut payload = count.to_be_bytes().to_vec();
@@ -681,14 +697,14 @@ pub fn build_headers(entries: &[(u16, u64, Vec<u8>)], trans: u16) -> Result<Vec<
         unit.extend_from_slice(&(name.len() as u16).to_be_bytes());
         unit.extend_from_slice(name);
 
-        let full = payload.len() + unit.len() > FRAME_BUDGET
-            || (cap > 0 && in_frame >= cap);
+        let full = payload.len() + unit.len() > FRAME_BUDGET;
         if full && in_frame > 0 {
             frames.push(assemble_dfile_packet(1, 0, 0, trans, &payload)?);
             payload = count.to_be_bytes().to_vec();
             in_frame = 0;
         }
         if payload.len() + unit.len() > FRAME_BUDGET {
+
             return Err(Error::Protocol(format!(
                 "文件名过长：{} 字节，单条清单装不进一帧",
                 name.len()
@@ -701,33 +717,6 @@ pub fn build_headers(entries: &[(u16, u64, Vec<u8>)], trans: u16) -> Result<Vec<
         frames.push(assemble_dfile_packet(1, 0, 0, trans, &payload)?);
     }
     Ok(frames)
-}
-
-pub fn parse_headers(payload: &[u8], expected_count: u16) -> Result<Vec<(u16, u64, Vec<u8>)>> {
-    if payload.len() < 14 || u16::from_be_bytes([payload[0], payload[1]]) != expected_count {
-        return Err(Error::Format);
-    }
-    let mut offset = 2usize;
-    let mut out = Vec::new();
-    while offset < payload.len() {
-        if payload.len() - offset < 12 {
-            return Err(Error::Truncated);
-        }
-        let file_id = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
-        let size = u64::from_be_bytes(payload[offset + 2..offset + 10].try_into().map_err(|_| Error::Truncated)?);
-        let length = u16::from_be_bytes([payload[offset + 10], payload[offset + 11]]) as usize;
-        offset += 12;
-        if offset + length > payload.len() {
-            return Err(Error::Truncated);
-        }
-        let name = payload[offset..offset + length].to_vec();
-        offset += length;
-        if file_id == 0 || out.iter().any(|(id, _, _)| *id == file_id) {
-            return Err(Error::Format);
-        }
-        out.push((file_id, size, name));
-    }
-    Ok(out)
 }
 
 pub const BYTES_MAGIC: u32 = 0xBABE_FACE;
@@ -858,10 +847,12 @@ mod tests {
 
     #[test]
     fn manifest_163_files_split_but_count_is_total() {
+
         let entries: Vec<(u16, u64, Vec<u8>)> = (1..=163u16)
             .map(|i| (i, 1024u64, format!("照片_{i:03}.jpg").into_bytes()))
             .collect();
         let frames = build_headers(&entries, 1).unwrap();
+
         assert!(frames.len() > 1, "163 条会拆成多帧");
         for f in &frames {
             let (kind, _fl, _ss, trans, size) = parse_dfile_header(f).unwrap();
@@ -871,6 +862,7 @@ mod tests {
             assert_eq!(c, 163, "每帧 count 都必须是总文件数");
             assert!(size > 0);
         }
+
         let mut ids = Vec::new();
         for f in &frames {
             let (_, _fl, _ss, _trans, size) = parse_dfile_header(f).unwrap();
@@ -884,6 +876,7 @@ mod tests {
 
     #[test]
     fn manifest_chunks_by_bytes_like_ipad() {
+
         let entries: Vec<(u16, u64, Vec<u8>)> = (1..=512u16)
             .map(|i| (i, 1u64, vec![b'a'; 40]))
             .collect();
@@ -900,6 +893,7 @@ mod tests {
 
     #[test]
     fn manifest_too_many_files_is_rejected() {
+
         let n = MAX_MANIFEST_ENTRIES + 1;
         let entries: Vec<(u16, u64, Vec<u8>)> = (0..n)
             .map(|i| ((i % 60000 + 1) as u16, 4096u64, format!("f{i:04}.bin").into_bytes()))
@@ -910,6 +904,7 @@ mod tests {
 
     #[test]
     fn dfile_stamp_follows_peer_family() {
+
         let apple = dfile_stamp_for(PeerKind::Apple);
         assert!(
             apple > 0 && apple < 100_000_000_000_000,
@@ -924,6 +919,7 @@ mod tests {
 
     #[test]
     fn cipher_state_is_per_thread() {
+
         set_peer_kind(PeerKind::Apple);
         assert_eq!(
             negotiate_cipher(Some(CIPHER_CLEAR | CIPHER_CHACHA)),
@@ -971,6 +967,7 @@ mod tests {
 
     #[test]
     fn settings_receiver_profile_is_byte_identical() {
+
         let p = build_settings_payload(true);
         assert_eq!(p.len(), 108);
         assert_eq!(&p[0..8], &[8, 0, 0, 0, 0, 0, 0, 100]);
@@ -986,8 +983,10 @@ mod tests {
 
     #[test]
     fn settings_data_frame_size_must_match_real_frames() {
+
         let profile = SettingsProfile::phone_exact_with(1472);
         let encoded = profile.encode();
+
         let dfs = u32::from_be_bytes([
             encoded[8 + 16],
             encoded[8 + 17],
@@ -995,6 +994,7 @@ mod tests {
             encoded[8 + 19],
         ]);
         assert_eq!(dfs, 1472, "声明值必须等于实际整帧长度");
+
         let base = SettingsProfile::phone_exact().encode();
         assert_eq!(encoded.len(), base.len());
         assert_ne!(encoded, base, "dfs 应该确实被替换了");
@@ -1002,6 +1002,7 @@ mod tests {
 
     #[test]
     fn settings_phone_exact_is_byte_identical_to_device_baseline() {
+
         let expected = "05c000020000000100000000000000400000ffff0000036c756e6b6e6f776e000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100010000000a00000007000000";
         let got = SettingsProfile::phone_exact().encode();
         assert_eq!(got.len(), 8 + 103);
@@ -1021,9 +1022,10 @@ mod tests {
     #[test]
     fn channel_frame_roundtrip() {
         let key = [9u8; 32];
-        let header = (FRAME_MAGIC_WORD, 6, 42, 0x94, 0);
+        let header = (crate::FRAME_MAGIC_WORD, 6, 42, 0x94, 0);
         let wire_frame = seal_channel_frame(&key, header, b"payload", 5).unwrap();
         let (got_header, plain) = parse_channel_frame(&wire_frame, &key).unwrap();
+
         assert_eq!(got_header.0, header.0);
         assert_eq!(got_header.1, header.1);
         assert_eq!(got_header.2, header.2);
@@ -1077,6 +1079,7 @@ mod tests {
     fn dfile_chunk_rejects_bad_input() {
         let key = [3u8; 32];
         assert!(build_data_block(&key, &[], 0, 3, 1, 1).is_err());
+
         assert!(build_data_block(&key, &vec![0u8; 1423], 0, 3, 1, 1).is_ok());
         let big = build_data_block(&key, &vec![0u8; DFILE_MAX_CONTENT], 0, 3, 1, 1);
         assert!(big.is_ok(), "{:?}", big.err());
@@ -1109,17 +1112,20 @@ mod tests {
 
     #[test]
     fn channel_frame_layout_roundtrip() {
+
         let key = [7u8; 32];
         let plain = br#"{"CODE":3,"P2P_IP":"192.168.1.2","P2P_PORT":1234,"PROTOCOL_TYPE":4}"#;
         let wire_frame = seal_channel_frame(&key, (0xFFFF_0004, 16, 42, 0, 0), plain, 9).unwrap();
         let ((typ, sub, seq, fl, len), got) = parse_channel_frame(&wire_frame, &key).unwrap();
         assert_eq!((typ, sub, seq, fl), (0xFFFF_0004, 16, 42, 0));
+
         assert_eq!(len as usize, plain.len() + 12 + 16);
         assert_eq!(got, plain);
     }
 
     #[test]
     fn headerless_frame_decodes() {
+
         use aes_gcm::aead::{Aead, KeyInit};
         use aes_gcm::{Aes256Gcm, Nonce};
         let key = [9u8; 32];
@@ -1133,6 +1139,7 @@ mod tests {
         let mut wire_frame = crate::frame_encode(21, 0, 0, &payload).unwrap();
 
         assert!(parse_channel_frame(&wire_frame, &key).is_err());
+
         let ((_, sub, _, _, len), got) = decode_channel_headerless(&wire_frame, &key).unwrap();
         assert_eq!(sub, 0, "类型由调用方按阶段补");
         assert_eq!(len as usize, plain.len());

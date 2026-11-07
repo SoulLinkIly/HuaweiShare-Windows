@@ -1,5 +1,8 @@
+//! 开机自启：读写 HKCU 的 Run 项，并核对当前 exe 路径。
+
 #![cfg(windows)]
 
+use crate::ui::text::wide;
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
@@ -11,15 +14,15 @@ use windows_sys::Win32::System::Registry::{
 const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "HWShareWin";
 
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
+
     Enabled,
+
     Disabled,
+
     Stale,
+
     Unavailable,
 }
 
@@ -71,6 +74,7 @@ fn read_value(key: HKEY) -> Result<Option<String>, String> {
     let name = wide(VALUE_NAME);
     let mut size: u32 = 0;
     let mut kind: u32 = 0;
+
     let code = unsafe {
         RegQueryValueExW(
             key,

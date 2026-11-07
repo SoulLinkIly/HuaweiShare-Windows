@@ -1,47 +1,48 @@
+//! 托盘图标与消息循环：菜单命令分发、气泡、通知队列。
+
 #![cfg(windows)]
 
+use crate::ui::text::wide;
 use std::ffi::c_void;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows_sys::Win32::System::Console::GetConsoleWindow;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, ShellExecuteW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
     NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+mod dialogs;
+mod menu;
+
+use dialogs::*;
+use menu::*;
+
+pub use dialogs::{open_or_pick_dest, send_clipboard_now};
+
 const WM_APP: u32 = 0x8000;
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_NOTICE: u32 = WM_APP + 2;
+/// 「又有人启动了一个」：由后启动的那个进程投递给这里，让**活着的**这个去弹提示。
+///
+/// 后启动的进程拿不到互斥量就得立刻退出，自己弹的窗口会被进程退出一起带走——
+/// 屏幕上什么也留不下，用户只知道「双击了但没反应」。所以提示交给已经在跑的这个来弹。
+const WM_DUP_START: u32 = WM_APP + 3;
 
-const ID_OPEN: usize = 1001;
-const ID_ABOUT: usize = 1004;
-const ID_PICK_DIR: usize = 1008;
-const ID_AUTOSTART: usize = 1010;
-const ID_SEND_BASE: usize = 1200;
-const ID_TARGET_BASE: usize = 1400;
-const ID_TARGET_RESCAN: usize = 1464;
-const ID_TARGET_CLEAR: usize = 1465;
-const ID_TARGET_HINT: usize = 1466;
-const ID_SEND_NONE: usize = 1299;
-const ID_CLIP_BASE: usize = 1300;
-const ID_CLIP_NONE: usize = 1399;
-const ID_QUIT: usize = 1099;
 
 const TRAY_UID: u32 = 1;
 
 static HWND_SLOT: AtomicIsize = AtomicIsize::new(0);
-static RECEIVED_FILES: AtomicU64 = AtomicU64::new(0);
-static RECEIVED_BYTES: AtomicU64 = AtomicU64::new(0);
 static ICON_SLOT: AtomicIsize = AtomicIsize::new(0);
 
 static CONTEXT: Mutex<Option<Context>> = Mutex::new(None);
 static NOTICES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
-static MENU_PEERS: Mutex<Vec<crate::peers::PeerInfo>> = Mutex::new(Vec::new());
+
+/// 同一时刻只放一条通知窗，后来的直接丢。
+static ALERT_BUSY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct Context {
@@ -52,16 +53,14 @@ struct Context {
 
 pub fn log_line(text: &str) {
     use std::io::Write;
-    let Some(base) = std::env::var_os("LOCALAPPDATA") else {
-        return;
-    };
+
     static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOG_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let dir = std::path::PathBuf::from(base).join("HWShareWin");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = crate::store::home();
     let path = dir.join("hwshare.log");
+
     const MAX_LOG: u64 = 512 * 1024;
     if let Ok(meta) = std::fs::metadata(&path) {
         if meta.len() > MAX_LOG {
@@ -77,10 +76,6 @@ pub fn log_line(text: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "[{stamp}] pid={} {text}", std::process::id());
     }
-}
-
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn context_text() -> Context {
@@ -118,6 +113,11 @@ pub fn set_dest(dest: &str) {
 }
 
 pub fn notify(title: &str, body: &str) {
+    // 优先走自绘的右下角提示：系统气泡会被专注助手整条吞掉，样式也不受控。
+    // 起不来（建窗失败 / 非 Windows / `HWSHARE_TOAST=0`）时才回落到气泡。
+    if crate::toast::push(title, body) {
+        return;
+    }
     if let Ok(mut q) = NOTICES.lock() {
         q.push((title.to_string(), body.to_string()));
         if q.len() > 16 {
@@ -130,11 +130,6 @@ pub fn notify(title: &str, body: &str) {
             PostMessageW(hwnd as HWND, WM_NOTICE, 0, 0);
         }
     }
-}
-
-pub fn add_received(files: u64, bytes: u64) {
-    RECEIVED_FILES.fetch_add(files, Ordering::Relaxed);
-    RECEIVED_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
 unsafe fn load_icon(blob: &[u8], want: i32) -> *mut c_void {
@@ -185,70 +180,21 @@ unsafe fn load_icon(blob: &[u8], want: i32) -> *mut c_void {
     std::ptr::null_mut()
 }
 
-pub fn open_dest_folder() {
-    let dest = context_text().dest;
-    unsafe { open_folder(&dest) };
+fn copy_wide<const N: usize>(dst: &mut [u16; N], text: &str) {
+    for (i, ch) in wide(text).iter().take(N - 1).enumerate() {
+        dst[i] = *ch;
+    }
 }
 
-pub fn open_or_pick_dest(owner: HWND) {
-    let dest = crate::config::current();
-    if dest.is_dir() {
-        let text = dest.display().to_string();
-        unsafe { open_folder(&text) };
-        return;
-    }
-    log_line(&format!(
-        "接收目录不存在：{}，弹选择框",
-        dest.display()
-    ));
+pub(super) fn message_box(owner: HWND, text: &str, flags: u32) {
     unsafe {
-        let _ = windows_sys::Win32::System::Com::CoInitializeEx(
-            std::ptr::null(),
-            windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
+        MessageBoxW(
+            owner,
+            wide(text).as_ptr(),
+            wide("华为分享").as_ptr(),
+            flags,
         );
-        let Some(path) = pick_folder(owner) else {
-            log_line("用户取消了重新选择接收目录");
-            return;
-        };
-        let text = path.display().to_string();
-        if let Err(e) = crate::config::set_dest(&path) {
-            log_line(&format!("保存接收目录失败: {e}"));
-        }
-        if let Err(e) = std::fs::create_dir_all(&path) {
-            log_line(&format!("创建接收目录失败: {e}"));
-        }
-        set_dest(&text);
-        notify("接收目录已更新", &text);
-        log_line(&format!("接收目录 -> {text}（原目录不存在）"));
-        open_folder(&text);
     }
-}
-
-pub fn send_clipboard_now(owner: HWND) {
-    let Some(peer) = crate::peers::selected() else {
-        alert(
-            "还没选发送目标",
-            "右键托盘图标 →「发送目标」里挑一台手机，再发剪贴板。",
-        );
-        return;
-    };
-    unsafe { send_clipboard(owner, peer) };
-}
-
-unsafe fn open_folder(dest: &str) {
-    if dest.is_empty() {
-        return;
-    }
-    let op = wide("open");
-    let path = wide(dest);
-    ShellExecuteW(
-        std::ptr::null_mut(),
-        op.as_ptr(),
-        path.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-        1,
-    );
 }
 
 unsafe fn balloon(hwnd: HWND, title: &str, body: &str) {
@@ -258,67 +204,9 @@ unsafe fn balloon(hwnd: HWND, title: &str, body: &str) {
     nid.uID = TRAY_UID;
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_INFO;
-    for (i, ch) in wide(title).iter().take(63).enumerate() {
-        nid.szInfoTitle[i] = *ch;
-    }
-    for (i, ch) in wide(body).iter().take(255).enumerate() {
-        nid.szInfo[i] = *ch;
-    }
+    copy_wide(&mut nid.szInfoTitle, title);
+    copy_wide(&mut nid.szInfo, body);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
-}
-
-fn kind_text(kind: &str) -> &'static str {
-    match kind {
-        "phone" => "手机",
-        "tablet" => "平板",
-        "computer" => "电脑",
-        _ => "",
-    }
-}
-
-fn ago_text(age: std::time::Duration) -> String {
-    let secs = age.as_secs();
-    if secs < 90 {
-        "1 分钟".to_string()
-    } else if secs < 3600 {
-        format!("{} 分钟", secs / 60)
-    } else {
-        format!("{} 小时", secs / 3600)
-    }
-}
-
-fn peer_name(p: &crate::peers::PeerInfo) -> String {
-    let kind = kind_text(&p.kind);
-    if kind.is_empty() {
-        p.name.clone()
-    } else {
-        format!("{}（{}）", p.name, kind)
-    }
-}
-
-fn peer_line(p: &crate::peers::PeerInfo) -> String {
-    let online = p.seen.elapsed() <= crate::peers::ONLINE_WINDOW;
-    let kind = kind_text(&p.kind);
-    let mut detail: Vec<String> = Vec::new();
-    if !kind.is_empty() {
-        detail.push(kind.to_string());
-    }
-    if !online {
-        detail.push(format!("{}前", ago_text(p.seen.elapsed())));
-    }
-    let line = if detail.is_empty() {
-        p.name.clone()
-    } else {
-        format!("{}（{}）", p.name, detail.join(" · "))
-    };
-    menu_text(&line)
-}
-
-fn menu_text(s: &str) -> String {
-    s.replace('&', "&&")
-        .replace('\t', " ")
-        .replace('\n', " ")
-        .replace('\r', " ")
 }
 
 pub fn refresh_tooltip() {
@@ -327,10 +215,11 @@ pub fn refresh_tooltip() {
         return;
     }
     let ctx = context_text();
-    let target = match crate::peers::selected() {
-        Some(p) if crate::peers::is_online(&p) => format!("发送给 {}", p.name),
-        Some(p) => format!("发送给 {}（离线）", p.name),
-        None => "未选发送目标".to_string(),
+    let targets = crate::peers::targets();
+    let target = if targets.is_empty() {
+        "未选发送目标".to_string()
+    } else {
+        target_summary(&targets, "发送给 ")
     };
     let text = format!("华为分享 · {} · {}", ctx.name, target);
     unsafe {
@@ -339,410 +228,8 @@ pub fn refresh_tooltip() {
         nid.hWnd = raw as HWND;
         nid.uID = TRAY_UID;
         nid.uFlags = NIF_TIP;
-        for (i, ch) in wide(&text).iter().take(127).enumerate() {
-            nid.szTip[i] = *ch;
-        }
+        copy_wide(&mut nid.szTip, &text);
         Shell_NotifyIconW(NIM_MODIFY, &nid);
-    }
-}
-
-unsafe fn build_menu() -> HMENU {
-    let menu = CreatePopupMenu();
-    if menu.is_null() {
-        return menu;
-    }
-    let view = crate::peers::view(std::time::Duration::from_secs(3600));
-    let peers = view.peers;
-    let effective = view.selected;
-    if let Ok(mut slot) = MENU_PEERS.lock() {
-        *slot = peers.clone();
-    }
-
-    let target_menu = CreatePopupMenu();
-    if peers.is_empty() {
-        AppendMenuW(
-            target_menu,
-            MF_STRING | MF_GRAYED,
-            ID_TARGET_HINT,
-            wide("未发现设备").as_ptr(),
-        );
-        AppendMenuW(
-            target_menu,
-            MF_STRING | MF_GRAYED,
-            ID_TARGET_HINT,
-            wide("① 手机/平板打开「华为分享」").as_ptr(),
-        );
-        AppendMenuW(
-            target_menu,
-            MF_STRING | MF_GRAYED,
-            ID_TARGET_HINT,
-            wide("② 保持亮屏，与本机同一 Wi-Fi").as_ptr(),
-        );
-    } else {
-        for (index, peer) in peers.iter().enumerate() {
-            let checked = effective
-                .as_ref()
-                .map(|e| e.host == peer.host)
-                .unwrap_or(false);
-            let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
-            AppendMenuW(
-                target_menu,
-                flags,
-                ID_TARGET_BASE + index,
-                wide(&peer_line(peer)).as_ptr(),
-            );
-        }
-    }
-    AppendMenuW(target_menu, MF_SEPARATOR, 0, std::ptr::null());
-    AppendMenuW(
-        target_menu,
-        MF_STRING,
-        ID_TARGET_RESCAN,
-        wide("重新扫描局域网").as_ptr(),
-    );
-    if effective.is_some() {
-        AppendMenuW(
-            target_menu,
-            MF_STRING,
-            ID_TARGET_CLEAR,
-            wide("清除选择（不指定目标）").as_ptr(),
-        );
-    }
-
-    let target_label = match &effective {
-        Some(p) if crate::peers::is_online(p) => format!("发送目标：{}", p.name),
-        Some(p) => format!("发送目标：{}（离线）", p.name),
-        None => "发送目标：未选择".to_string(),
-    };
-    AppendMenuW(
-        menu,
-        MF_POPUP | MF_STRING,
-        target_menu as usize,
-        wide(&target_label).as_ptr(),
-    );
-    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    AppendMenuW(menu, MF_STRING, ID_OPEN, wide("打开接收文件夹").as_ptr());
-    AppendMenuW(menu, MF_STRING, ID_PICK_DIR, wide("选择接收文件夹…").as_ptr());
-
-    let submenu = CreatePopupMenu();
-    if peers.is_empty() {
-        AppendMenuW(
-            submenu,
-            MF_STRING | MF_GRAYED,
-            ID_SEND_NONE,
-            wide("未发现设备 · 先打开手机分享").as_ptr(),
-        );
-    } else {
-        for (index, peer) in peers.iter().enumerate() {
-            let flags = MF_STRING
-                | if crate::peers::is_online(peer) {
-                    0
-                } else {
-                    MF_GRAYED
-                };
-            AppendMenuW(
-                submenu,
-                flags,
-                ID_SEND_BASE + index,
-                wide(&peer_line(peer)).as_ptr(),
-            );
-        }
-    }
-    AppendMenuW(
-        menu,
-        MF_POPUP | MF_STRING,
-        submenu as usize,
-        wide("发送文件到手机").as_ptr(),
-    );
-
-    let clip_menu = CreatePopupMenu();
-    if peers.is_empty() {
-        AppendMenuW(
-            clip_menu,
-            MF_STRING | MF_GRAYED,
-            ID_CLIP_NONE,
-            wide("未发现设备 · 先打开手机分享").as_ptr(),
-        );
-    } else {
-        for (index, peer) in peers.iter().enumerate() {
-            let flags = MF_STRING
-                | if crate::peers::is_online(peer) {
-                    0
-                } else {
-                    MF_GRAYED
-                };
-            AppendMenuW(
-                clip_menu,
-                flags,
-                ID_CLIP_BASE + index,
-                wide(&peer_line(peer)).as_ptr(),
-            );
-        }
-    }
-    let clip_flags = MF_POPUP | MF_STRING | if peers.is_empty() { MF_GRAYED } else { 0 };
-    AppendMenuW(
-        menu,
-        clip_flags,
-        clip_menu as usize,
-        wide("发送剪贴板文本").as_ptr(),
-    );
-
-    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    let startup = crate::autostart::status();
-    let startup_flags = MF_STRING | if startup.on() { MF_CHECKED } else { 0 };
-    AppendMenuW(
-        menu,
-        startup_flags,
-        ID_AUTOSTART,
-        wide(&crate::autostart::menu_label(startup)).as_ptr(),
-    );
-    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    AppendMenuW(menu, MF_STRING, ID_ABOUT, wide("关于").as_ptr());
-    AppendMenuW(menu, MF_STRING, ID_QUIT, wide("退出").as_ptr());
-
-    menu
-}
-
-unsafe fn show_menu(hwnd: HWND) {
-    refresh_tooltip();
-    let menu = build_menu();
-    if menu.is_null() {
-        return;
-    }
-    let mut pt = POINT { x: 0, y: 0 };
-    GetCursorPos(&mut pt);
-    SetForegroundWindow(hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, std::ptr::null());
-    DestroyMenu(menu);
-}
-
-unsafe fn toggle_autostart(hwnd: HWND) {
-    match crate::autostart::toggle() {
-        Ok(true) => notify(
-            "开机自启动",
-            "已开启：下次登录 Windows 时自动启动，浮窗停在上次退出时的位置",
-        ),
-        Ok(false) => notify("开机自启动", "已关闭：登录时不再自动启动"),
-        Err(e) => {
-            log_line(&format!("[自启动] 切换失败：{e}"));
-            MessageBoxW(
-                hwnd,
-                wide(&format!("设置开机自启动失败：\n{e}")).as_ptr(),
-                wide("华为分享").as_ptr(),
-                MB_OK | MB_ICONWARNING,
-            );
-        }
-    }
-}
-
-unsafe fn show_about(hwnd: HWND) {
-    let ctx = context_text();
-    let text = format!(
-        "华为分享  v{}\n\n设备名：{}\n保存到：{}\n本机地址：{}\n\n第三方互操作性实现，与华为公司无隶属关系。\n按 GPL-3.0 分发，详见随附的 LICENSE。\n\n手机端「华为分享」可见性只有 10 分钟，\n超时后需要重新打开开关。",
-        env!("CARGO_PKG_VERSION"),
-        ctx.name,
-        ctx.dest,
-        ctx.local
-    );
-    MessageBoxW(
-        hwnd,
-        wide(&text).as_ptr(),
-        wide("关于 华为分享").as_ptr(),
-        MB_OK | MB_ICONINFORMATION,
-    );
-}
-
-unsafe fn pick_folder(owner: HWND) -> Option<std::path::PathBuf> {
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{
-        SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
-        BROWSEINFOW,
-    };
-
-    let mut display = [0u16; 260];
-    let title = wide("选择接收文件夹");
-    let mut info = BROWSEINFOW {
-        hwndOwner: owner,
-        pidlRoot: std::ptr::null_mut(),
-        pszDisplayName: display.as_mut_ptr(),
-        lpszTitle: title.as_ptr(),
-        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
-        lpfn: None,
-        lParam: 0,
-        iImage: 0,
-    };
-
-    let pidl = SHBrowseForFolderW(&mut info);
-    if pidl.is_null() {
-        return None;
-    }
-    let mut buffer = [0u16; 1024];
-    let ok = SHGetPathFromIDListW(pidl, buffer.as_mut_ptr());
-    CoTaskMemFree(pidl as *const core::ffi::c_void);
-    if ok == 0 {
-        return None;
-    }
-    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-    Some(std::path::PathBuf::from(String::from_utf16_lossy(
-        &buffer[..len],
-    )))
-}
-
-unsafe fn choose_dir(owner: HWND) {
-    let Some(path) = pick_folder(owner) else {
-        return;
-    };
-    let text = path.display().to_string();
-    if let Err(e) = crate::config::set_dest(&path) {
-        log_line(&format!("保存接收目录失败: {e}"));
-    }
-    let _ = std::fs::create_dir_all(&path);
-    set_dest(&text);
-    notify("接收目录已更新", &text);
-    log_line(&format!("接收目录 -> {text}"));
-}
-
-unsafe fn send_clipboard(owner: HWND, peer: crate::peers::PeerInfo) {
-    let Some(text) = crate::clipboard::read_text() else {
-        MessageBoxW(
-            owner,
-            wide("剪贴板里没有文本。\n\n目前只支持纯文本，图片和文件请用「发送文件到手机」。").as_ptr(),
-            wide("华为分享").as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-        return;
-    };
-    let path = match crate::clipboard::write_temp(&text) {
-        Ok(path) => path,
-        Err(e) => {
-            MessageBoxW(
-                owner,
-                wide(&format!("写入临时文件失败：{e}")).as_ptr(),
-                wide("华为分享").as_ptr(),
-                MB_OK | MB_ICONERROR,
-            );
-            return;
-        }
-    };
-    let summary = crate::clipboard::preview(&text, 24);
-    match crate::dispatch::send_to(peer, vec![path], device_name()) {
-        Ok(_) => notify("正在发送剪贴板", &summary),
-        Err(e) => {
-            MessageBoxW(
-                owner,
-                wide(&e).as_ptr(),
-                wide("华为分享").as_ptr(),
-                MB_OK | MB_ICONWARNING,
-            );
-        }
-    }
-}
-
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match msg {
-        WM_TRAY => {
-            let event = (lparam & 0xFFFF) as u32;
-            if event == WM_LBUTTONDBLCLK as u32 {
-                crate::dropzone::toggle();
-            } else if event == WM_RBUTTONUP as u32 || event == WM_CONTEXTMENU as u32 {
-                show_menu(hwnd);
-            }
-            0
-        }
-        WM_NOTICE => {
-            let pending: Vec<(String, String)> = NOTICES
-                .lock()
-                .map(|mut q| q.drain(..).collect())
-                .unwrap_or_default();
-            for (title, body) in pending {
-                balloon(hwnd, &title, &body);
-            }
-            0
-        }
-        WM_COMMAND => {
-            match (wparam & 0xFFFF) as usize {
-                ID_OPEN => open_folder(&context_text().dest),
-                ID_PICK_DIR => choose_dir(hwnd),
-                ID_AUTOSTART => toggle_autostart(hwnd),
-                ID_ABOUT => show_about(hwnd),
-                ID_QUIT => PostQuitMessage(0),
-                id if (ID_TARGET_BASE..ID_TARGET_BASE + 64).contains(&id) => {
-                    let index = id - ID_TARGET_BASE;
-                    let peer = MENU_PEERS
-                        .lock()
-                        .ok()
-                        .and_then(|slot| slot.get(index).cloned());
-                    if let Some(peer) = peer {
-                        crate::peers::set_default(peer.clone());
-                        let body = if crate::peers::is_online(&peer) {
-                            format!("已选择 {}", peer_name(&peer))
-                        } else {
-                            format!("已选择 {}（当前离线，等它亮屏后再发）", peer_name(&peer))
-                        };
-                        notify("默认发送目标", &body);
-                        refresh_tooltip();
-                    }
-                }
-                ID_TARGET_RESCAN => {
-                    crate::discovery::request_scan();
-                    notify(
-                        "正在扫描",
-                        "设备会在一两秒内出现在「发送目标」里（手机需亮屏、开着分享）",
-                    );
-                }
-                ID_TARGET_CLEAR => {
-                    crate::peers::clear_default();
-                    notify(
-                        "已清除发送目标",
-                        "把文件拖进投递窗时会再问一次要发给谁",
-                    );
-                    refresh_tooltip();
-                }
-                id if (ID_SEND_BASE..ID_SEND_BASE + 64).contains(&id) => {
-                    let index = id - ID_SEND_BASE;
-                    let peer = MENU_PEERS
-                        .lock()
-                        .ok()
-                        .and_then(|slot| slot.get(index).cloned());
-                    if let Some(peer) = peer {
-                        let files = pick_files(hwnd);
-                        if !files.is_empty() {
-                            if let Err(e) =
-                                crate::dispatch::send_to(peer, files, device_name())
-                            {
-                                MessageBoxW(
-                                    hwnd,
-                                    wide(&e).as_ptr(),
-                                    wide("华为分享").as_ptr(),
-                                    MB_OK | MB_ICONWARNING,
-                                );
-                            }
-                        }
-                    }
-                }
-                id if (ID_CLIP_BASE..ID_CLIP_BASE + 64).contains(&id) => {
-                    let index = id - ID_CLIP_BASE;
-                    let peer = MENU_PEERS
-                        .lock()
-                        .ok()
-                        .and_then(|slot| slot.get(index).cloned());
-                    if let Some(peer) = peer {
-                        send_clipboard(hwnd, peer);
-                    }
-                }
-                _ => {}
-            }
-            0
-        }
-        WM_CLOSE => {
-            PostQuitMessage(0);
-            0
-        }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
@@ -756,6 +243,7 @@ pub fn enable_dpi_awareness() {
             let addr = windows_sys::Win32::System::LibraryLoader::GetProcAddress(lib, name.as_ptr());
             addr.map(|f| f as usize)
         };
+
         if let Some(addr) = get(b"SetProcessDpiAwarenessContext\0") {
             let f: unsafe extern "system" fn(isize) -> i32 = std::mem::transmute(addr);
             if f(-4) != 0 {
@@ -769,62 +257,10 @@ pub fn enable_dpi_awareness() {
     }
 }
 
-unsafe fn pick_files(owner: HWND) -> Vec<PathBuf> {
-    use windows_sys::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
-        OFN_PATHMUSTEXIST, OPENFILENAMEW,
-    };
-
-    let mut buffer = vec![0u16; 64 * 1024];
-    let filter: Vec<u16> =
-        "所有文件\0*.*\0图片\0*.jpg;*.jpeg;*.png;*.gif;*.webp;*.bmp\0视频\0*.mp4;*.mov;*.mkv\0\0"
-            .encode_utf16()
-            .collect();
-    let title = wide("选择要发送的文件");
-    let mut ofn: OPENFILENAMEW = std::mem::zeroed();
-    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-    ofn.hwndOwner = owner;
-    ofn.lpstrFilter = filter.as_ptr();
-    ofn.lpstrFile = buffer.as_mut_ptr();
-    ofn.nMaxFile = buffer.len() as u32;
-    ofn.lpstrTitle = title.as_ptr();
-    ofn.Flags = OFN_ALLOWMULTISELECT
-        | OFN_EXPLORER
-        | OFN_FILEMUSTEXIST
-        | OFN_PATHMUSTEXIST
-        | OFN_NOCHANGEDIR;
-    if GetOpenFileNameW(&mut ofn) == 0 {
-        return Vec::new();
-    }
-    parse_multi(&buffer)
-}
-
-fn parse_multi(buffer: &[u16]) -> Vec<PathBuf> {
-    let end = buffer.iter().position(|&c| c == 0).unwrap_or(0);
-    let first = String::from_utf16_lossy(&buffer[..end]);
-    let rest = &buffer[(end + 1).min(buffer.len())..];
-    if rest.first().copied().unwrap_or(0) == 0 {
-        return if first.is_empty() {
-            Vec::new()
-        } else {
-            vec![PathBuf::from(first)]
-        };
-    }
-    let dir = Path::new(&first);
-    let mut names = Vec::new();
-    let mut index = 0usize;
-    while index < rest.len() && rest[index] != 0 {
-        let len = rest[index..].iter().position(|&c| c == 0).unwrap_or(0);
-        if len == 0 {
-            break;
-        }
-        names.push(String::from_utf16_lossy(&rest[index..index + len]));
-        index += len + 1;
-    }
-    names.into_iter().map(|name| dir.join(name)).collect()
-}
-
 pub fn run_loop() -> i32 {
+    // GUI 进程的事件出口：库里的日志写进托盘日志，文本进度条不画（进度由浮窗显示）。
+    crate::report::install(log_line, |_| {}, || {});
+
     unsafe {
         let _ = windows_sys::Win32::System::Com::CoInitializeEx(
             std::ptr::null(),
@@ -884,7 +320,8 @@ pub fn run_loop() -> i32 {
         if icon.is_null() {
             icon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
         }
-        if std::env::var("HWSHARE_DEBUG").is_ok() {
+
+        if crate::env::present("HWSHARE_DEBUG") {
             let note = if custom {
                 format!("自定义图标已加载（{want}px）")
             } else {
@@ -902,9 +339,7 @@ pub fn run_loop() -> i32 {
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
         nid.hIcon = icon;
-        for (i, ch) in wide(&format!("华为分享 · {}", ctx.name)).iter().take(127).enumerate() {
-            nid.szTip[i] = *ch;
-        }
+        copy_wide(&mut nid.szTip, &format!("华为分享 · {}", ctx.name));
         if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
             log_line("失败：Shell_NotifyIcon(NIM_ADD) 返回 0（任务栏不接收图标）");
             return 1;
@@ -915,7 +350,7 @@ pub fn run_loop() -> i32 {
             "托盘图标已挂载（退化为系统默认图标）"
         });
 
-        let _ = crate::peers::view(std::time::Duration::from_secs(3600));
+        let _ = crate::peers::view(crate::peers::LIST_TTL);
         refresh_tooltip();
         crate::dropzone::show();
 
@@ -934,20 +369,176 @@ pub fn run_loop() -> i32 {
     }
 }
 
-pub fn hide_console() {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_TRAY => {
+            let event = (lparam & 0xFFFF) as u32;
+            if event == WM_LBUTTONDBLCLK as u32 {
+
+                crate::dropzone::toggle();
+            } else if event == WM_RBUTTONUP as u32 || event == WM_CONTEXTMENU as u32 {
+                show_menu(hwnd);
+            }
+            0
+        }
+        WM_NOTICE => {
+            let pending: Vec<(String, String)> = NOTICES
+                .lock()
+                .map(|mut q| q.drain(..).collect())
+                .unwrap_or_default();
+            for (title, body) in pending {
+                balloon(hwnd, &title, &body);
+            }
+            0
+        }
+        WM_DUP_START => {
+            // 有人又双击了一次 exe。他要的信息只有两条：程序在跑、窗口在哪。
+            // 顺手把投递窗叫回来——「我双击了怎么没反应」通常就是面板被收进托盘了。
+            crate::dropzone::show();
+            refresh_tooltip();
+            log_line("[启动] 又开了一次，已提示「已在运行」并叫回投递窗");
+            notify(
+                "华为分享已经在运行了",
+                "图标在屏幕右下角，投递窗口已经帮你叫回来",
+            );
+            0
+        }
+        WM_COMMAND => {
+            run_command(hwnd, (wparam & 0xFFFF) as usize);
+            0
+        }
+        WM_CLOSE => {
+            PostQuitMessage(0);
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 主菜单命令的统一下发点。
+///
+/// 菜单用 `TPM_RETURNCMD` 自己取返回值（这样「发送目标」才能做成原地重开的多选弹窗），
+/// 所以命令不一定经过 `WM_COMMAND`；两条路径都收敛到这里，逻辑只写一遍。
+fn run_command(hwnd: HWND, id: usize) {
     unsafe {
-        let console = GetConsoleWindow();
-        if !console.is_null() {
-            ShowWindow(console, SW_HIDE);
+        match id {
+            ID_OPEN => open_folder(&context_text().dest),
+            ID_PICK_DIR => choose_dir(hwnd),
+            ID_AUTOSTART => toggle_autostart(hwnd),
+            ID_HISTORY_FILE => {
+                let path = crate::history::log_file();
+                if path.exists() {
+                    open_file(&path.to_string_lossy());
+                } else {
+                    notify(
+                        "还没有传输记录",
+                        "收发过一次文件后，这里会有完整日志（几点、发给谁、几个文件、多大）",
+                    );
+                }
+            }
+            ID_ABOUT => show_about(hwnd),
+            ID_QUIT => PostQuitMessage(0),
+            id if (ID_TARGET_BASE..ID_TARGET_BASE + MENU_PEER_CAP).contains(&id) => {
+                if let Some(peer) = peer_at(id - ID_TARGET_BASE) {
+                    let on = crate::peers::toggle_target(&peer);
+                    log_line(&format!(
+                        "[目标] {} {}",
+                        if on { "勾选" } else { "取消" },
+                        peer_name(&peer)
+                    ));
+                    refresh_tooltip();
+                }
+            }
+            ID_TARGET_RESCAN => {
+                crate::discovery::request_scan();
+                log_line("[目标] 手动重新扫描");
+                notify(
+                    "正在扫描",
+                    "设备会在一两秒内出现在「发送目标」里（手机需亮屏、开着分享）",
+                );
+            }
+            ID_TARGET_CLEAR => {
+                crate::peers::clear_targets();
+                log_line("[目标] 已清空");
+                notify("已清除发送目标", "拖文件进投递窗时会提示先挑一台");
+                refresh_tooltip();
+            }
+            id if (ID_SEND_BASE..ID_SEND_BASE + MENU_PEER_CAP).contains(&id) => {
+                let peer = peer_at(id - ID_SEND_BASE);
+                if let Some(peer) = peer {
+                    let files = pick_files(hwnd);
+                    if !files.is_empty() {
+                        if let Err(e) = crate::dispatch::send_to(peer, files, device_name()) {
+                            message_box(hwnd, &e, MB_OK | MB_ICONWARNING);
+                        }
+                    }
+                }
+            }
+            id if (ID_CLIP_BASE..ID_CLIP_BASE + MENU_PEER_CAP).contains(&id) => {
+                if let Some(peer) = peer_at(id - ID_CLIP_BASE) {
+                    send_clipboard(hwnd, peer);
+                }
+            }
+            _ => {}
         }
     }
 }
 
-pub fn alert(title: &str, body: &str) -> i32 {
-    if crate::notice::show(title, body) {
-        1
-    } else {
-        0
+fn peer_at(index: usize) -> Option<crate::peers::PeerInfo> {
+    MENU_PEERS
+        .lock()
+        .ok()
+        .and_then(|slot| slot.get(index).cloned())
+}
+
+/// 弹一条通知。
+///
+/// **不阻塞调用方**：过去这里直接跑 `notice::show`，而它内部是 `GetMessageW` 模态循环，
+/// 于是从浮窗线程调用时会把进度绘制和定时器一起冻住（更糟的情况是从接收线程调用，
+/// 连接收都会停）。现在丢到独立线程去弹，调用方立刻返回。
+pub fn alert(title: &str, body: &str) {
+    if ALERT_BUSY.swap(true, Ordering::SeqCst) {
+        // 已经有一条在显示：丢掉后来的，别让错误处理把屏幕铺满。
+        return;
+    }
+    let title = title.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        // notice::show 里有 GDI 调用，异常路径下 panic 并非不可能；
+        // 一旦 panic 而没复位 ALERT_BUSY，之后所有通知都会被当成"已有一条"丢掉。
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::notice::show(&title, &body);
+        }));
+        ALERT_BUSY.store(false, Ordering::SeqCst);
+    });
+}
+
+/// `alert` 的同步版：调用线程一直卡到用户点「好」为止。
+///
+/// 只给「马上就要 `exit`」的启动路径用。`alert` 是丢线程去弹的，而进程一退出所有线程
+/// 都被硬杀，那张卡还没来得及画出来就没了——正是「重复启动毫无提示」的成因。
+pub fn alert_blocking(title: &str, body: &str) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::notice::show(title, body);
+    }));
+}
+
+/// 叫醒已经在运行的那个实例，让它弹提示并把投递窗叫回来。
+///
+/// 按类名找窗：`FindWindowW` 只在同一会话/同一桌面的顶层窗口里找，正好是本进程要的
+/// 那个。找不到就返回 `false`（对方可能刚拿到互斥量、窗口还没建出来），调用方自己兜底。
+pub fn poke_running_instance() -> bool {
+    unsafe {
+        let class = wide("HWShareTrayWindow");
+        let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
+        if hwnd.is_null() {
+            return false;
+        }
+        PostMessageW(hwnd, WM_DUP_START, 0, 0) != 0
     }
 }
 
@@ -957,6 +548,7 @@ pub fn active() -> bool {
 
 #[allow(dead_code)]
 fn _assert_send_sync() {
+
     fn assert<T: Send + Sync>() {}
     assert::<AtomicI64>();
 }
@@ -974,6 +566,7 @@ mod menu_text_tests {
             port: 1234,
             kind: kind.to_string(),
             seen: Instant::now() - age,
+            accepts: true,
         }
     }
 
@@ -986,11 +579,22 @@ mod menu_text_tests {
     }
 
     #[test]
-    fn offline_peer_shows_age_without_dot() {
+    fn closed_peer_shows_hint_without_dot() {
+        let mut p = peer("nova 14 Ultra", "phone", Duration::from_secs(5));
+        p.accepts = false;
+        let line = peer_line(&p);
+        assert!(line.contains("对方关了华为分享"), "{line}");
+        assert!(line.contains("手机"), "{line}");
+        assert!(!line.contains('●') && !line.contains('○'), "{line}");
+    }
+
+    #[test]
+    fn offline_peer_says_offline_without_dot() {
         let line = peer_line(&peer("HUAWEI MatePad", "tablet", Duration::from_secs(300)));
         assert!(line.starts_with("HUAWEI MatePad"), "{line}");
         assert!(line.contains("平板"), "{line}");
-        assert!(line.contains("5 分钟前"), "{line}");
+        assert!(line.contains("离线"), "{line}");
+        assert!(!line.contains("分钟前"), "离线只写「离线」，不写多久以前：{line}");
         assert!(!line.contains('○'), "{line}");
         assert!(!line.contains('●'), "{line}");
     }
@@ -1003,14 +607,25 @@ mod menu_text_tests {
     }
 
     #[test]
-    fn age_text_is_readable() {
-        assert_eq!(ago_text(Duration::from_secs(10)), "1 分钟");
-        assert_eq!(ago_text(Duration::from_secs(600)), "10 分钟");
-        assert_eq!(ago_text(Duration::from_secs(7200)), "2 小时");
+    fn target_summary_counts_multiple_picks() {
+        let a = peer("nova 14 Ultra", "phone", Duration::from_secs(1));
+        let b = peer("MatePad", "tablet", Duration::from_secs(1));
+        assert_eq!(target_summary(&[], "发送目标："), "发送目标：未选择");
+        assert_eq!(target_summary(&[a.clone()], "发送目标："), "发送目标：nova 14 Ultra");
+        assert_eq!(
+            target_summary(&[a.clone(), b], "发送目标："),
+            "发送目标：nova 14 Ultra 等 2 台"
+        );
+        let offline = peer("息屏手机", "phone", Duration::from_secs(60));
+        assert_eq!(
+            target_summary(&[offline], "发送目标："),
+            "发送目标：息屏手机（离线）"
+        );
     }
 
     #[test]
     fn ampersand_in_name_is_escaped_for_menus() {
+
         let line = peer_line(&peer("R&D-PC", "computer", Duration::from_secs(3)));
         assert!(line.contains("R&&D-PC"), "{line}");
         assert!(!line.contains('\t'));
@@ -1039,13 +654,40 @@ mod menu_text_tests {
         out
     }
 
+    /// 按文字找菜单项（含子菜单），返回它的状态位（`MF_CHECKED` / `MF_GRAYED` …）。
+    unsafe fn item_state(menu: HMENU, needle: &str) -> Option<u32> {
+        for index in 0..GetMenuItemCount(menu).max(0) {
+            let mut buf = [0u16; 256];
+            let n = GetMenuStringW(
+                menu,
+                index as u32,
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+                MF_BYPOSITION,
+            );
+            if n > 0 && String::from_utf16_lossy(&buf[..n as usize]).contains(needle) {
+                return Some(GetMenuState(menu, index as u32, MF_BYPOSITION));
+            }
+            let sub = GetSubMenu(menu, index);
+            if !sub.is_null() {
+                if let Some(state) = item_state(sub, needle) {
+                    return Some(state);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn menu_lists_peers_with_state_and_actions() {
+
         let _g = crate::peers::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::peers::upsert("测试机甲", "10.77.0.1", 4321, "phone");
-        crate::peers::upsert("测试平板乙", "10.77.0.2", 4322, "tablet");
+        crate::peers::reset_for_test();
+
+        crate::peers::upsert("测试机甲", "10.77.0.1", 4321, "phone", true);
+        crate::peers::upsert("测试平板乙", "10.77.0.2", 4322, "tablet", true);
 
         unsafe {
             let menu = build_menu();
@@ -1058,6 +700,7 @@ mod menu_text_tests {
             }
 
             let text = labels.join(" | ");
+
             assert!(
                 labels.iter().any(|l| l.contains("测试机甲（手机）")),
                 "{text}"
@@ -1073,25 +716,104 @@ mod menu_text_tests {
                 "菜单里不该再有圆点标记：{text}"
             );
             assert!(
-                labels.iter().any(|l| l.contains("重新扫描局域网")),
-                "{text}"
+                !text.contains("同时发给"),
+                "群发开关已经换成「发送目标」多选：{text}"
             );
+            assert!(
+                text.contains("发送目标：未选择"),
+                "没勾设备时标题该是「未选择」：{text}"
+            );
+            assert!(
+                text.contains("重新扫描局域网"),
+                "「重新扫描」应该在发送目标二级菜单里：{text}"
+            );
+
             assert!(
                 labels.iter().any(|l| l.contains("打开接收文件夹")),
                 "{text}"
             );
+
             assert!(
                 labels.iter().any(|l| l.contains("开机自启动")),
                 "{text}"
             );
+
             let pos_tab = labels.iter().position(|l| l.contains("测试平板乙")).unwrap();
             let pos_ph = labels.iter().position(|l| l.contains("测试机甲")).unwrap();
             assert!(pos_tab < pos_ph, "菜单顺序不稳定: {text}");
 
-            assert!(text.contains("发送目标："), "{text}");
             assert!(text.contains("发送文件到手机"), "{text}");
             assert!(text.contains("发送剪贴板文本"), "{text}");
         }
+    }
+
+    #[test]
+    fn target_menu_is_multi_select_and_greys_offline() {
+        let _g = crate::peers::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::peers::reset_for_test();
+
+        crate::peers::upsert("在线甲", "10.78.0.1", 4001, "phone", true);
+        crate::peers::upsert("在线乙", "10.78.0.2", 4002, "tablet", true);
+        crate::peers::upsert_aged("熄屏丙", "10.78.0.3", 4003, "phone", Duration::from_secs(30));
+        // 超过 5 分钟没消息：连列表都不该进。
+        crate::peers::upsert_aged(
+            "很久以前",
+            "10.78.0.4",
+            4004,
+            "phone",
+            crate::peers::LIST_TTL + Duration::from_secs(1),
+        );
+
+        let picked = crate::peers::snapshot(crate::peers::LIST_TTL)
+            .into_iter()
+            .find(|p| p.host == "10.78.0.1")
+            .expect("在线甲 应该在表里");
+        crate::peers::toggle_target(&picked);
+
+        unsafe {
+            let menu = build_menu();
+            assert!(!menu.is_null());
+            let labels = menu_labels(menu);
+            let checked = item_state(menu, "在线甲（手机）");
+            let offline = item_state(menu, "熄屏丙（手机");
+            let gone = item_state(menu, "很久以前");
+            let single = item_state(menu, "在线乙（平板）");
+            DestroyMenu(menu);
+
+            let text = labels.join(" | ");
+            assert!(checked.expect("在线甲 不见了") & MF_CHECKED != 0, "{text}");
+            assert!(single.expect("在线乙 不见了") & MF_CHECKED == 0, "{text}");
+            assert!(
+                single.expect("在线乙 不见了") & MF_GRAYED == 0,
+                "在线的要能点：{text}"
+            );
+            assert!(
+                offline.expect("熄屏丙 不见了") & MF_GRAYED != 0,
+                "离线的必须灰掉：{text}"
+            );
+            assert!(text.contains("熄屏丙") && text.contains("离线"), "{text}");
+            assert!(gone.is_none(), "超过 5 分钟的设备要从菜单里消失：{text}");
+            assert!(text.contains("重新扫描局域网"), "{text}");
+            assert!(text.contains("清除选择"), "已经勾了设备，要给清除入口：{text}");
+        }
+
+        // 勾第二台：两台都打勾，标题变成「等 2 台」。
+        let second = crate::peers::snapshot(crate::peers::LIST_TTL)
+            .into_iter()
+            .find(|p| p.host == "10.78.0.2")
+            .expect("在线乙 应该在表里");
+        crate::peers::toggle_target(&second);
+
+        unsafe {
+            let menu = build_menu();
+            let labels = menu_labels(menu);
+            DestroyMenu(menu);
+            let text = labels.join(" | ");
+            assert!(text.contains("等 2 台"), "多选后标题要报总数：{text}");
+        }
+        crate::peers::reset_for_test();
     }
 
     #[test]

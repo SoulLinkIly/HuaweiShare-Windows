@@ -1,3 +1,5 @@
+//! 标准 ChaCha20-Poly1305（RFC 8439，12 字节 nonce），用于数据帧加密。
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -221,22 +223,32 @@ fn pad16(mac: &mut Vec<u8>, len: usize) {
     }
 }
 
+fn poly_key(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
+    let block0 = chacha20_block(key, nonce, 0);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&block0[..32]);
+    out
+}
+
+fn poly_input(aad: &[u8], ct: &[u8]) -> Vec<u8> {
+    let mut mac_in = Vec::with_capacity(aad.len() + ct.len() + 32);
+    mac_in.extend_from_slice(aad);
+    pad16(&mut mac_in, aad.len());
+    mac_in.extend_from_slice(ct);
+    pad16(&mut mac_in, ct.len());
+    mac_in.extend_from_slice(&(aad.len() as u64).to_le_bytes());
+    mac_in.extend_from_slice(&(ct.len() as u64).to_le_bytes());
+    mac_in
+}
+
 pub fn aead_encrypt(key: &[u8; 32], nonce: &[u8], aad: &[u8], plain: &[u8]) -> Vec<u8> {
     let nonce: &[u8; 12] = <&[u8; 12]>::try_from(nonce).expect("nonce 必须 12 字节");
-    let block0 = chacha20_block(key, nonce, 0);
-    let mut poly_key = [0u8; 32];
-    poly_key.copy_from_slice(&block0[..32]);
+    let poly_key = poly_key(key, nonce);
 
     let mut ct = plain.to_vec();
     chacha20_xor(key, nonce, 1, &mut ct);
 
-    let mut mac_in = Vec::with_capacity(aad.len() + ct.len() + 32);
-    mac_in.extend_from_slice(aad);
-    pad16(&mut mac_in, aad.len());
-    mac_in.extend_from_slice(&ct);
-    pad16(&mut mac_in, ct.len());
-    mac_in.extend_from_slice(&(aad.len() as u64).to_le_bytes());
-    mac_in.extend_from_slice(&(ct.len() as u64).to_le_bytes());
+    let mac_in = poly_input(aad, &ct);
 
     let tag = poly1305(&poly_key, &mac_in);
     ct.extend_from_slice(&tag);
@@ -249,17 +261,9 @@ pub fn aead_decrypt(key: &[u8; 32], nonce: &[u8], aad: &[u8], sealed: &[u8]) -> 
         return None;
     }
     let (ct, tag) = sealed.split_at(sealed.len() - 16);
-    let block0 = chacha20_block(key, nonce, 0);
-    let mut poly_key = [0u8; 32];
-    poly_key.copy_from_slice(&block0[..32]);
+    let poly_key = poly_key(key, nonce);
 
-    let mut mac_in = Vec::with_capacity(aad.len() + ct.len() + 32);
-    mac_in.extend_from_slice(aad);
-    pad16(&mut mac_in, aad.len());
-    mac_in.extend_from_slice(ct);
-    pad16(&mut mac_in, ct.len());
-    mac_in.extend_from_slice(&(aad.len() as u64).to_le_bytes());
-    mac_in.extend_from_slice(&(ct.len() as u64).to_le_bytes());
+    let mac_in = poly_input(aad, ct);
 
     let want = poly1305(&poly_key, &mac_in);
     if !ct_eq(&want, tag) {
